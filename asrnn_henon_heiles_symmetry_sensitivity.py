@@ -123,15 +123,21 @@ class Config:
     noise_standard_deviation: float = 0
     noise_correlation_time: float = 0
     validation_fraction: float = 0.25
+    augment_dataset: bool = True
 
     # Training. Adam is convenient for resolving the evolution in time.
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 10000
+    training_steps: int = 50000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    checkpoint_steps: list[int] = field(
-        default_factory=lambda: [0, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
+    l1_regularization: float = 1e-5
+    # Checkpoints are specified as fractions of training_steps (each in
+    # [0, 1]) so they scale automatically if training_steps changes, e.g.
+    # under --quick. Resolved to absolute step indices in validate_config.
+    checkpoint_fractions: list[float] = field(
+        default_factory=lambda: [0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0]
     )
+    checkpoint_steps: list[int] = field(default_factory=list)
     lbfgs_history_size: int = 10
 
     # Functional sensitivity probe: a 2D (q1, q2) grid.
@@ -192,7 +198,7 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.trajectory_splits = 2
         cfg.coarsening_factor = 2
         cfg.training_steps = 2
-        cfg.checkpoint_steps = [0, 1, 2]
+        cfg.checkpoint_fractions = [0.0, 0.5, 1.0]
         cfg.analysis_symmetric_alphas = [0.8, 1.0, 1.2]
         cfg.analysis_breaking_alpha2_offsets = [-0.3, 0.0, 0.3]
         cfg.q_grid_points_per_axis = 4
@@ -212,11 +218,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("q_grid_points_per_axis must be at least 2.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
+    if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
+        raise ValueError("checkpoint_fractions must all lie in [0, 1].")
     cfg.checkpoint_steps = sorted(
-        {int(s) for s in cfg.checkpoint_steps if 0 <= int(s) <= cfg.training_steps}
+        {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
     )
-
 
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alpha_pairs, device=device, dtype=dtype)
@@ -237,6 +244,7 @@ def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
         device=device,
         dtype=dtype,
         seed_ou=cfg.seed,
+        augment_dataset=cfg.augment_dataset,
     )
     return train_test_split(trajectories, params, indices, val_size=cfg.validation_fraction)
 
@@ -429,7 +437,7 @@ def analyse_checkpoint(
         reflection_sensitivity_residual = sensitivity_transform_residual(j_x, j_refl, refl_mat)
         reflection_equivariance_error = per_parameter_equivariance_error(j_x, j_refl, refl_mat)
 
-        sensitivity = torch.sqrt(torch.mean(j_x.double().square(), dim=(0, 1)))
+        sensitivity = torch.sqrt(torch.mean(j_x.detach().cpu().double().square(), dim=(0, 1)))
         jac_flat = j_x.reshape(n_points * 2, -1)
 
         # Noether energy-conservation diagnostic (see the double-well script
@@ -444,7 +452,7 @@ def analyse_checkpoint(
             dim=1,
         )
         energy_conservation_violation = relative_energy_drift(
-            grad_e_p.double(), grad_e_q.double(), f_x.double(), learned_dqdt_values.double()
+            grad_e_p.detach().cpu().double(), grad_e_q.detach().cpu().double(), f_x.detach().cpu().double(), learned_dqdt_values.detach().cpu().double()
         )
 
         result = {
@@ -763,6 +771,7 @@ def train_and_analyse(cfg: Config) -> None:
         trajectory_window=cfg.trajectory_window,
         residuals_fn=residuals_fn,
         integrator=integrator,
+        l1_regularization=cfg.l1_regularization,
     )
 
     torch.save(model.state_dict(), output_dir / "final_model.pt")

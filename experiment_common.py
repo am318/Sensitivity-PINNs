@@ -71,6 +71,7 @@ def run_training_loop(
     trajectory_window: int,
     residuals_fn: Callable[..., torch.Tensor],
     integrator: torch.nn.Module,
+    l1_regularization: float,
 ) -> tuple[dict[str, list[float]], dict[int, dict[str, torch.Tensor]]]:
     """Train with Adam or LBFGS, snapshotting the model's state at ``checkpoint_steps``.
 
@@ -91,11 +92,23 @@ def run_training_loop(
 
         def closure():
             optimizer.zero_grad()
-            loss = residuals_fn(
-                train_trajectories, train_params, train_instants, trajectory_window, integrator
-            )
-            loss.backward()
-            return loss
+
+            if l1_regularization == 0.0:
+                loss = residuals_fn(
+                    train_trajectories, train_params, train_instants, trajectory_window, integrator
+                )
+                loss.backward()
+                return loss
+            else:
+                l1_penalty = l1_regularization * sum(
+                    p.abs().sum() for p in model.parameters()
+                )
+                loss = residuals_fn(
+                                train_trajectories, train_params, train_instants, trajectory_window, integrator
+                            )
+                total_loss = loss + l1_penalty
+                total_loss.backward()
+                return total_loss
 
         if optimizer_name.lower() == "lbfgs":
             training_loss = float(optimizer.step(closure).detach().cpu())

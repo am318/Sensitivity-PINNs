@@ -100,14 +100,20 @@ class Config:
     integration_dt: float = 0.1
     coarsening_factor: int = 50
     validation_fraction: float = 0.25
+    augment_dataset: bool = True
 
     optimizer: str = "adam"
-    training_steps: int = 10000
+    training_steps: int = 50000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    checkpoint_steps: list[int] = field(
-        default_factory=lambda: [0, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
+    l1_regularization: float = 1e-5
+    # Checkpoints are specified as fractions of training_steps (each in
+    # [0, 1]) so they scale automatically if training_steps changes, e.g.
+    # under --quick. Resolved to absolute step indices in validate_config.
+    checkpoint_fractions: list[float] = field(
+        default_factory=lambda: [0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0]
     )
+    checkpoint_steps: list[int] = field(default_factory=list)
     lbfgs_history_size: int = 10
 
     q_extent: float = 1.0
@@ -156,7 +162,7 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.trajectory_splits = 2
         cfg.coarsening_factor = 2
         cfg.training_steps = 2
-        cfg.checkpoint_steps = [0, 1, 2]
+        cfg.checkpoint_fractions = [0.0, 0.5, 1.0]
         cfg.analysis_alphas = [-0.5, 0.0, 0.5]
         cfg.q_grid_points_per_axis = 4
         cfg.top_parameters_to_report = 5
@@ -175,11 +181,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("q_grid_points_per_axis must be at least 2.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
+    if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
+        raise ValueError("checkpoint_fractions must all lie in [0, 1].")
     cfg.checkpoint_steps = sorted(
-        {int(s) for s in cfg.checkpoint_steps if 0 <= int(s) <= cfg.training_steps}
+        {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
     )
-
 
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alphas, device=device, dtype=dtype)
@@ -188,6 +195,7 @@ def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
         alphas, F, total_length, cfg.trajectory_window, cfg.sampled_instants,
         dt=cfg.integration_dt, in_conds=cfg.initial_conditions_per_alpha,
         coarsening_factor=cfg.coarsening_factor, device=device, dtype=dtype,
+        augment_dataset=cfg.augment_dataset,
     )
     return train_test_split(trajectories, params, indices, val_size=cfg.validation_fraction)
 
@@ -349,7 +357,7 @@ def analyse_checkpoint(
         rotation_sensitivity_residual = sensitivity_transform_residual(j_x, j_rot, rot_mat)
         rotation_equivariance_error = per_parameter_equivariance_error(j_x, j_rot, rot_mat)
 
-        sensitivity = torch.sqrt(torch.mean(j_x.double().square(), dim=(0, 1)))
+        sensitivity = torch.sqrt(torch.mean(j_x.detach().cpu().double().square(), dim=(0, 1)))
         jac_flat = j_x.reshape(n_points * 2, -1)
 
         bifurcation_target = bifurcation_generator_target(q1_grid, q2_grid)
@@ -377,7 +385,8 @@ def analyse_checkpoint(
             (q1_grid**2 + q2_grid**2).unsqueeze(-1) * torch.stack([q1_grid, q2_grid], dim=1)
         )
         energy_conservation_violation = relative_energy_drift(
-            grad_e_p.double(), grad_e_q.double(), f_x.double(), learned_dqdt_values.double()
+            grad_e_p.detach().cpu().double(), grad_e_q.detach().cpu().double(),
+            f_x.detach().cpu().double(), learned_dqdt_values.detach().cpu().double()
         )
 
         alpha_results.append(
@@ -579,6 +588,7 @@ def train_and_analyse(cfg: Config) -> None:
         optimizer=optimizer, optimizer_name=cfg.optimizer, model=model,
         train_data=train_data, val_data=validation_data,
         trajectory_window=cfg.trajectory_window, residuals_fn=residuals_fn, integrator=integrator,
+        l1_regularization=cfg.l1_regularization,
     )
 
     torch.save(model.state_dict(), output_dir / "final_model.pt")

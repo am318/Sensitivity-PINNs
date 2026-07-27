@@ -95,7 +95,7 @@ class Config:
     # step). "direct_mlp": one plain MLP outputting (dp/dt, dq/dt) directly,
     # integrated with the same kick-drift-kick step shape but with no
     # conservation structure at all (Experiment 2's architecture comparison).
-    architecture: str = "hamiltonian"  # hamiltonian or direct_mlp
+    architecture: str = "direct_mlp"  # hamiltonian or direct_mlp
 
     # ASRNN Hamiltonian network. V_net receives (q, alpha); K_net receives p.
     kinetic_hidden_dim: int = 50
@@ -122,16 +122,22 @@ class Config:
     noise_standard_deviation: float = 0
     noise_correlation_time: float = 0
     validation_fraction: float = 0.25
+    augment_dataset: bool = True
 
     # Training. Adam is convenient for resolving the evolution in time.
     # Set optimizer="lbfgs" to mirror the original model_generator.py.
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 10000
+    training_steps: int = 50000
     learning_rate: float = 1e-3  # Adam default; use 1.0 for LBFGS
     weight_decay: float = 0.0
-    checkpoint_steps: list[int] = field(
-        default_factory=lambda: [0, 10, 50, 100, 250, 500, 1000, 1500, 2000, 5000, 10000]
+    l1_regularization: float = 1e-5
+    # Checkpoints are specified as fractions of training_steps (each in
+    # [0, 1]) so they scale automatically if training_steps changes, e.g.
+    # under --quick. Resolved to absolute step indices in validate_config.
+    checkpoint_fractions: list[float] = field(
+        default_factory=lambda: [0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0]
     )
+    checkpoint_steps: list[int] = field(default_factory=list)
     lbfgs_history_size: int = 10
 
     # Functional sensitivity probe. A denser alpha grid gives a clearer view
@@ -190,7 +196,7 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.trajectory_splits = 2
         cfg.coarsening_factor = 2
         cfg.training_steps = 2
-        cfg.checkpoint_steps = [0, 1, 2]
+        cfg.checkpoint_fractions = [0.0, 0.5, 1.0]
         cfg.analysis_alphas = [-0.5, 0.0, 0.5]
         cfg.q_probe_points = 9
         cfg.top_parameters_to_report = 5
@@ -215,25 +221,25 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("potential_plot_points must be at least 2.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
+    if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
+        raise ValueError("checkpoint_fractions must all lie in [0, 1].")
     cfg.checkpoint_steps = sorted(
-        {int(s) for s in cfg.checkpoint_steps if 0 <= int(s) <= cfg.training_steps}
+        {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
     )
-
 
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alphas, device=device, dtype=dtype)
     total_length = cfg.trajectory_splits + cfg.trajectory_window - 1
+
     noise_variance_fraction = cfg.noise_standard_deviation**2
     if cfg.noise_standard_deviation > 0:
         if cfg.noise_correlation_time <= 0:
-            raise ValueError(
-                "noise_correlation_time must be positive when noise is enabled."
-            )
+            raise ValueError("noise_correlation_time must be positive when noise is enabled.")
         theta = 1.0 / cfg.noise_correlation_time
     else:
-        # generate_data ignores theta when apply_ou_noise=False.
         theta = 0.0
+
     trajectories, params, indices = generate_data(
         alphas,
         F,
@@ -250,11 +256,12 @@ def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
         device=device,
         dtype=dtype,
         seed_ou=cfg.seed,
+        augment_dataset=cfg.augment_dataset
     )
+
     return train_test_split(
         trajectories, params, indices, val_size=cfg.validation_fraction
     )
-
 
 def build_model(cfg: Config, device: torch.device, dtype: torch.dtype):
     if cfg.architecture == "direct_mlp":
@@ -457,7 +464,7 @@ def analyse_checkpoint(
         ) = tangent_projection(
             jacobian, bifurcation_direction, cfg.tangent_svd_relative_cutoff
         )
-        sensitivity = torch.sqrt(torch.mean(jacobian.double().square(), dim=0))
+        sensitivity = torch.sqrt(torch.mean(jacobian.detach().cpu().double().square(), dim=0))
         curvature, curvature_gradient = curvature_and_parameter_gradient(
             model, alpha, cfg.architecture, device=device, dtype=dtype
         )
@@ -468,10 +475,10 @@ def analyse_checkpoint(
         # and fall only insofar as training makes H_theta approach the truth.
         grad_e_q = float(alpha) * q_values + q_values**3
         energy_conservation_violation = relative_energy_drift(
-            p_values.unsqueeze(-1).double(),
-            grad_e_q.unsqueeze(-1).double(),
-            predicted_force_tensor.unsqueeze(-1).double(),
-            learned_dqdt_values.unsqueeze(-1).double(),
+            p_values.detach().cpu().unsqueeze(-1).double(),
+            grad_e_q.detach().cpu().unsqueeze(-1).double(),
+            predicted_force_tensor.detach().cpu().unsqueeze(-1).double(),
+            learned_dqdt_values.detach().cpu().unsqueeze(-1).double(),
         )
         alpha_results.append(
             {
@@ -494,7 +501,7 @@ def analyse_checkpoint(
                 "attribution_coefficients": coefficients.cpu().tolist(),
                 "curvature": curvature,
                 "true_curvature": float(alpha),
-                "curvature_sensitivity": curvature_gradient.double().abs().cpu().tolist(),
+                "curvature_sensitivity": curvature_gradient.detach().cpu().double().abs().tolist(),
                 "module_sensitivity": aggregate_by_module(sensitivity, parameter_slices),
                 "module_equivariance_error": aggregate_by_module_mean(
                     equivariance_error_by_parameter, parameter_slices
@@ -877,6 +884,7 @@ def train_and_analyse(cfg: Config) -> None:
         trajectory_window=cfg.trajectory_window,
         residuals_fn=residuals_fn,
         integrator=integrator,
+        l1_regularization=cfg.l1_regularization,
     )
 
     torch.save(model.state_dict(), output_dir / "final_model.pt")
