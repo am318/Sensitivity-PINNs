@@ -88,7 +88,7 @@ run_job() {
 {
   "architecture": "$arch",
   "learning_rate": $lr,
-  "l1_regularization": $l1,
+  "l1_weight": $l1,
   "weight_decay": $weight_decay,
   "augment_dataset": $aug,
   "direct_mlp_hidden_dim": $width,
@@ -100,7 +100,7 @@ EOF
 {
   "architecture": "$arch",
   "learning_rate": $lr,
-  "l1_regularization": $l1,
+  "l1_weight": $l1,
   "weight_decay": $weight_decay,
   "augment_dataset": $aug,
   "kinetic_hidden_dim": $width,
