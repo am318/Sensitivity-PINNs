@@ -250,7 +250,7 @@ def train_test_split(trajectories, params, indices, val_size: float = 0.25):
 class MLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 50, n_hidden: int = 1):
         super().__init__()
-        act = nn.Tanh()
+        act = nn.SiLU()
         layers = [nn.Linear(in_dim, hidden_dim), act]
         for _ in range(1, n_hidden):
             layers += [nn.Linear(hidden_dim, hidden_dim), act]

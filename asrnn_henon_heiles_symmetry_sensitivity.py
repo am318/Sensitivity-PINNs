@@ -130,7 +130,7 @@ class Config:
     training_steps: int = 50000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    l1_regularization: float = 1e-5
+    l1_weight: float = 1e-5
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
@@ -771,7 +771,7 @@ def train_and_analyse(cfg: Config) -> None:
         trajectory_window=cfg.trajectory_window,
         residuals_fn=residuals_fn,
         integrator=integrator,
-        l1_regularization=cfg.l1_regularization,
+        l1_weight=cfg.l1_weight,
     )
 
     torch.save(model.state_dict(), output_dir / "final_model.pt")

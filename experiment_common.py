@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import re
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +17,41 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm import tqdm
+
+
+def prettify_parameter_name(name: str) -> str:
+    """Turn a raw dotted parameter path (e.g. ``'V_net.net.2.weight'``) into a readable label.
+
+    Every model in this project follows one of a few shapes: an ASRNN-style
+    V_net/K_net split (``MLP.net`` is an ``nn.Sequential`` alternating
+    ``Linear``/activation, so parameters sit at even indices 0, 2, 4, ...),
+    a single unified dynamics net for direct_mlp (no V/K prefix), or the
+    escnn-wrapped equivariant net (extra ``inner.mlp.`` wrapper layers to
+    strip). This maps any of them to e.g. ``"V (potential): layer 2 weights"``,
+    falling back to the raw name if the pattern isn't recognised.
+    """
+    rest = name
+    if rest.startswith("V_net."):
+        prefix, rest = "V (potential)", rest[len("V_net."):]
+    elif rest.startswith("K_net."):
+        prefix, rest = "K (kinetic)", rest[len("K_net."):]
+    else:
+        prefix = "dynamics net"
+
+    rest = rest.replace("inner.mlp.", "net.")
+    match = re.match(r"net\.(\d+)\.(weight|weights|bias)$", rest)
+    if not match:
+        return name
+    layer_number = int(match.group(1)) // 2 + 1
+    kind = "biases" if match.group(2) == "bias" else "weights"
+    return f"{prefix}: layer {layer_number} {kind}"
+
+
+def module_colours(modules: list[str]) -> dict[str, Any]:
+    """Consistent colour-per-module assignment shared by every per-parameter scatter plot."""
+    cmap = plt.get_cmap("tab20" if len(modules) > 10 else "tab10")
+    colours = cmap(np.linspace(0.0, 1.0, len(modules)))
+    return dict(zip(modules, colours))
 
 
 def select_device(requested: str) -> torch.device:
@@ -71,7 +107,7 @@ def run_training_loop(
     trajectory_window: int,
     residuals_fn: Callable[..., torch.Tensor],
     integrator: torch.nn.Module,
-    l1_regularization: float,
+    l1_weight: float = 0.0,
 ) -> tuple[dict[str, list[float]], dict[int, dict[str, torch.Tensor]]]:
     """Train with Adam or LBFGS, snapshotting the model's state at ``checkpoint_steps``.
 
@@ -79,12 +115,30 @@ def run_training_loop(
     ``(trajectories, params, instants)`` data layout and the same
     ``residuals(trajectories, params, instants, window, integrator)`` /
     ``VerletIntegrator`` signatures, so this loop is identical across systems.
+
+    ``l1_weight > 0`` adds ``l1_weight * sum(|theta_i|)`` over every model
+    parameter to the trajectory-fitting loss -- an explicit sparsity pressure,
+    to test whether it makes an otherwise-unconstrained architecture's
+    parameters align more with the equivariant directions (i.e. improve
+    sensitivity equivariance) by cutting down the redundant/overparameterised
+    capacity that has no reason to respect the symmetry. The pure trajectory
+    loss (without the L1 term) is tracked separately in the returned history
+    under ``"trajectory_loss"`` so the fit-quality/sparsity tradeoff can be
+    read off directly, without the L1 term inflating what "training_loss"
+    means relative to an ``l1_weight=0`` run.
     """
     checkpoint_steps = set(int(s) for s in checkpoint_steps)
     train_trajectories, train_params, train_instants = train_data
     val_trajectories, val_params, val_instants = val_data
-    history: dict[str, list[float]] = {"step": [], "training_loss": [], "validation_loss": []}
+    history: dict[str, list[float]] = {
+        "step": [], "training_loss": [], "trajectory_loss": [], "validation_loss": [],
+    }
     checkpoint_states: dict[int, dict[str, torch.Tensor]] = {0: copy.deepcopy(model.state_dict())}
+
+    def l1_penalty() -> torch.Tensor:
+        return sum(p.abs().sum() for p in model.parameters())
+
+    trajectory_loss_value = [0.0]
 
     progress = tqdm(range(1, training_steps + 1), desc="training", unit="step", dynamic_ncols=True)
     for step in progress:
@@ -92,23 +146,13 @@ def run_training_loop(
 
         def closure():
             optimizer.zero_grad()
-
-            if l1_regularization == 0.0:
-                loss = residuals_fn(
-                    train_trajectories, train_params, train_instants, trajectory_window, integrator
-                )
-                loss.backward()
-                return loss
-            else:
-                l1_penalty = l1_regularization * sum(
-                    p.abs().sum() for p in model.parameters()
-                )
-                loss = residuals_fn(
-                                train_trajectories, train_params, train_instants, trajectory_window, integrator
-                            )
-                total_loss = loss + l1_penalty
-                total_loss.backward()
-                return total_loss
+            trajectory_loss = residuals_fn(
+                train_trajectories, train_params, train_instants, trajectory_window, integrator
+            )
+            trajectory_loss_value[0] = float(trajectory_loss.detach().cpu())
+            loss = trajectory_loss + l1_weight * l1_penalty() if l1_weight > 0 else trajectory_loss
+            loss.backward()
+            return loss
 
         if optimizer_name.lower() == "lbfgs":
             training_loss = float(optimizer.step(closure).detach().cpu())
@@ -125,12 +169,13 @@ def run_training_loop(
         )
         history["step"].append(step)
         history["training_loss"].append(training_loss)
+        history["trajectory_loss"].append(trajectory_loss_value[0])
         history["validation_loss"].append(validation_loss)
-        progress.set_postfix(train=f"{training_loss:.3e}", val=f"{validation_loss:.3e}")
+        progress.set_postfix(train=f"{trajectory_loss_value[0]:.3e}", val=f"{validation_loss:.3e}")
         if step in checkpoint_steps:
             checkpoint_states[step] = copy.deepcopy(model.state_dict())
             progress.write(
-                f"step {step:5d} | train {training_loss:.5e} | "
+                f"step {step:5d} | trajectory {trajectory_loss_value[0]:.5e} | "
                 f"validation {validation_loss:.5e}"
             )
 
@@ -149,13 +194,26 @@ def write_csv_rows(rows: list[dict[str, Any]], fieldnames: list[str], path: Path
 
 
 def plot_training_history(history: dict[str, list[float]], output_dir: Path) -> None:
-    """Plot optimisation and generalisation diagnostics."""
+    """Plot optimisation and generalisation diagnostics.
+
+    Uses ``trajectory_loss`` (the pure fit term, comparable to validation)
+    where available, falling back to ``training_loss`` for older history
+    dicts without it. When an L1 penalty was active, ``training_loss``
+    (the actual optimised objective, fit + penalty) is also shown as a
+    lighter dashed line so the two remain visually distinguishable.
+    """
     steps = np.asarray(history["step"])
-    training = np.asarray(history["training_loss"])
+    training = np.asarray(history.get("trajectory_loss", history["training_loss"]))
+    total_objective = np.asarray(history["training_loss"])
     validation = np.asarray(history["validation_loss"])
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
-    axes[0].plot(steps, training, label="training", linewidth=1.6)
+    axes[0].plot(steps, training, label="training (trajectory fit)", linewidth=1.6)
+    if not np.allclose(training, total_objective):
+        axes[0].plot(
+            steps, total_objective, label="training (fit + L1 penalty)",
+            linewidth=1.2, linestyle="--", color="tab:orange", alpha=0.7,
+        )
     axes[0].plot(steps, validation, label="validation", linewidth=1.6)
     axes[0].set_yscale("log")
     axes[0].set(title="ASRNN training history", xlabel="training step", ylabel="trajectory MSE")
@@ -183,39 +241,107 @@ def plot_ei_initial_vs_final(
     *,
     title: str,
     output_stem: Path,
+    quantity_label: str = "$E_i$",
+    log_scale: bool = False,
 ) -> None:
-    """Scatter of per-parameter E_i (sec. 0.6) at random init vs. the final checkpoint.
+    """Scatter of a per-parameter quantity (E_i by default) at random init vs. the final checkpoint.
 
     One point per parameter i, coloured by which named module (layer) it
     belongs to. Points on the y=x line are unchanged by training; points
-    below it improved; points above it got *less* equivariant during
-    training. This is the per-parameter complement to the module-mean bar
-    chart -- it shows the full spread within each layer, including outliers
-    (e.g. zero-initialised biases that start exactly equivariant and drift
-    away from it).
+    below it improved; points above it got worse. This is the per-parameter
+    complement to the module-mean bar chart -- it shows the full spread
+    within each layer, including outliers (e.g. zero-initialised biases that
+    start exactly equivariant and drift away from it).
+
+    ``log_scale=True`` is for quantities (like attribution coefficients c_i)
+    that span many orders of magnitude, including exact zeros for pruned
+    parameters -- those are floored to a small epsilon so they remain
+    visible rather than vanishing at the origin.
     """
     fig, ax = plt.subplots(figsize=(7.5, 7), constrained_layout=True)
     modules = list(parameter_slices.keys())
-    cmap = plt.get_cmap("tab20" if len(modules) > 10 else "tab10")
-    colours = cmap(np.linspace(0.0, 1.0, len(modules)))
+    colours = module_colours(modules)
 
-    for colour, name in zip(colours, modules):
+    if log_scale:
+        ei_initial = np.maximum(ei_initial, 1e-12)
+        ei_final = np.maximum(ei_final, 1e-12)
+
+    for name in modules:
         sl = parameter_slices[name]
         ax.scatter(
-            ei_initial[sl], ei_final[sl], s=14, color=colour, label=name,
-            alpha=0.75, edgecolors="none",
+            ei_initial[sl], ei_final[sl], s=14, color=colours[name],
+            label=prettify_parameter_name(name), alpha=0.75, edgecolors="none",
         )
 
-    upper = float(max(ei_initial.max(), ei_final.max(), 1e-6)) * 1.05
-    ax.plot([0, upper], [0, upper], "k--", linewidth=1, label="$y=x$ (unchanged)")
+    if log_scale:
+        lower = float(min(ei_initial.min(), ei_final.min())) / 1.5
+        upper = float(max(ei_initial.max(), ei_final.max())) * 1.5
+        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="$y=x$ (unchanged)")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set(xlim=(lower, upper), ylim=(lower, upper))
+    else:
+        upper = float(max(ei_initial.max(), ei_final.max(), 1e-6)) * 1.05
+        ax.plot([0, upper], [0, upper], "k--", linewidth=1, label="$y=x$ (unchanged)")
+        ax.set(xlim=(0, upper), ylim=(0, upper))
     ax.set(
-        xlim=(0, upper), ylim=(0, upper),
-        xlabel="$E_i$ at random init", ylabel="$E_i$ at final checkpoint",
+        xlabel=f"{quantity_label} at random init", ylabel=f"{quantity_label} at final checkpoint",
         title=title,
     )
     ax.set_aspect("equal")
-    ax.grid(alpha=0.25)
+    ax.grid(alpha=0.25, which="both" if log_scale else "major")
     ax.legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_magnitude_vs_quantity(
+    magnitude_initial: np.ndarray,
+    magnitude_final: np.ndarray,
+    quantity_initial: np.ndarray,
+    quantity_final: np.ndarray,
+    parameter_slices: dict[str, slice],
+    *,
+    quantity_label: str,
+    title: str,
+    output_stem: Path,
+) -> None:
+    """Scatter of |theta_i| (parameter magnitude) vs. a per-parameter quantity (S_i or E_i).
+
+    Two panels -- random init (left) and the final checkpoint (right) --
+    coloured by module, using the same colour/label scheme as
+    ``plot_ei_initial_vs_final``. Purpose: check whether an apparently small
+    E_i (or S_i) for particular parameters is a genuine alignment effect, or
+    simply an artefact of those parameters having been driven to near-zero
+    magnitude (e.g. by an L1 penalty) -- a near-dead parameter's own
+    sensitivity is often small too, which can make the *ratio* E_i
+    numerically small or noisy without reflecting real equivariant structure.
+    A real effect should show low values spread across a range of
+    magnitudes; a magnitude artefact shows a tight correlation between small
+    |theta_i| and small values of the quantity, concentrated at the low-
+    magnitude end.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), constrained_layout=True)
+    modules = list(parameter_slices.keys())
+    colours = module_colours(modules)
+
+    for ax, magnitude, quantity, subtitle in (
+        (axes[0], magnitude_initial, quantity_initial, "random init"),
+        (axes[1], magnitude_final, quantity_final, "trained"),
+    ):
+        for name in modules:
+            sl = parameter_slices[name]
+            ax.scatter(
+                np.maximum(magnitude[sl], 1e-12), np.maximum(quantity[sl], 1e-12),
+                s=14, color=colours[name], label=prettify_parameter_name(name),
+                alpha=0.75, edgecolors="none",
+            )
+        #ax.set_xscale("log")
+        #ax.set_yscale("log")
+        ax.set(xlabel=r"$|\theta_i|$ (parameter magnitude)", ylabel=quantity_label, title=f"{title} ({subtitle})")
+        ax.grid(alpha=0.25, which="both")
+    axes[1].legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
     fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
