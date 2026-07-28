@@ -114,6 +114,7 @@ class Config:
     # under --quick. Resolved to absolute step indices in validate_config.
     checkpoint_fractions: list[float] = field(
         default_factory=lambda: [0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0]
+    )
     # L1 penalty on all parameters, added to the trajectory-fitting loss --
     # tests whether an explicit sparsity pressure makes a non-equivariant
     # architecture's parameters align more with the equivariant directions
