@@ -85,14 +85,14 @@ class Config:
     dtype: str = "float32"
     output_dir: str = "outputs/asrnn_mexican_hat_symmetry"
 
-    architecture: str = "mlp"  # hamiltonian, direct_mlp, or equivariant
+    architecture: str = "hamiltonian"  # hamiltonian, direct_mlp, or equivariant
 
     kinetic_hidden_dim: int = 50
     kinetic_hidden_layers: int = 3
     potential_hidden_dim: int = 50
     potential_hidden_layers: int = 3
-    direct_mlp_hidden_dim: int = 10
-    direct_mlp_hidden_layers: int = 1
+    direct_mlp_hidden_dim: int = 32
+    direct_mlp_hidden_layers: int = 3
 
     training_alphas: list[float] = field(
         default_factory=lambda: [-1.4, -1.0, -0.6, -0.2, 0.2, 0.6, 1.0, 1.4]
@@ -116,21 +116,11 @@ class Config:
     # (i.e. improve sensitivity equivariance E_i) by squeezing out redundant
     # capacity that has no reason to respect the symmetry on its own.
     l1_weight: float = 1e-4
-    l1_regularization: float = 1e-5
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
     checkpoint_fractions: list[float] = field(
         default_factory=lambda: [0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0]
-    )
-    # L1 penalty on all parameters, added to the trajectory-fitting loss --
-    # tests whether an explicit sparsity pressure makes a non-equivariant
-    # architecture's parameters align more with the equivariant directions
-    # (i.e. improve sensitivity equivariance E_i) by squeezing out redundant
-    # capacity that has no reason to respect the symmetry on its own.
-    l1_weight: float = 1e-4
-    checkpoint_steps: list[int] = field(
-        default_factory=lambda: [0, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
     )
     checkpoint_steps: list[int] = field(default_factory=list)
     lbfgs_history_size: int = 10
@@ -161,7 +151,6 @@ def parse_args() -> argparse.Namespace:
         choices=["hamiltonian", "direct_mlp", "equivariant"],
         help="Override Config.architecture.",
     )
-    parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     return parser.parse_args()
 
@@ -361,7 +350,6 @@ def analyse_checkpoint(
     flat_names: list[str], parameter_slices: dict[str, slice],
 ) -> dict[str, Any]:
     model.eval()
-    parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1_grid, q2_grid = build_probe_grid(cfg, device, dtype)
     rot_mat = rotation_matrix(cfg.rotation_angle_degrees, device, dtype)
@@ -590,7 +578,6 @@ def plot_equivariance_by_module(all_results: list[dict[str, Any]], output_dir: P
     ax.bar(x + width / 2, after, width, label=f"step {last['step']} (trained)")
     ax.set_xticks(x)
     ax.set_xticklabels([prettify_parameter_name(m) for m in modules], rotation=60, ha="right", fontsize=8)
-    ax.set_xticklabels([prettify_parameter_name(m) for m in modules], rotation=60, ha="right", fontsize=8)
     ax.set(title="Rotation sensitivity-equivariance error $E_i$ by module", ylabel="mean $E_i$ within module")
     ax.grid(alpha=0.25, axis="y")
     ax.legend()
@@ -640,8 +627,6 @@ def plot_equivariance_scatter(
     ei_final = _alpha_averaged(last, "rotation_equivariance_error_by_parameter")
     plotting_slices = {name: sl for name, sl in parameter_slices.items() if not name.startswith("K_net.")}
     plot_ei_initial_vs_final(
-        ei_initial, ei_final, plotting_slices,
-        title="Rotation sensitivity-equivariance $E_i$: init vs. trained (mean over $\\alpha$)",
         ei_initial, ei_final, plotting_slices,
         title="Rotation sensitivity-equivariance $E_i$: init vs. trained (mean over $\\alpha$)",
         output_stem=output_dir / "equivariance_scatter",

@@ -39,9 +39,9 @@ _ROOT = Path(__file__).resolve().parent
 # see vendor_stubs/lie_learn/representations/SO3/wigner_d.py.
 sys.path.insert(0, str(_ROOT / "vendor_stubs"))
 sys.path.insert(0, str(_ROOT / "escnn"))
-from escnn import gspaces  # noqa: E402
-from escnn import group  # noqa: E402
-from escnn import nn as enn  # noqa: E402
+# from escnn import gspaces  # noqa: E402
+# from escnn import group  # noqa: E402
+# from escnn import nn as enn  # noqa: E402
 from torch.autograd import grad
 
 

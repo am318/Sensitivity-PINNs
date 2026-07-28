@@ -2,17 +2,18 @@
 set -euo pipefail
 
 SCRIPTS=(
-    "asrnn_double_well_bifurcation_sensitivity.py"
-    "asrnn_henon_heiles_symmetry_sensitivity.py"
+    # "asrnn_double_well_bifurcation_sensitivity.py"
+    # "asrnn_henon_heiles_symmetry_sensitivity.py"
     "asrnn_mexican_hat_symmetry_sensitivity.py"
 )
 
 ARCHITECTURES=(direct_mlp hamiltonian)
-L1S=(0 1e-3 1e-5)
+L1S=(0 1e-1 1e-2 1e-3 1e-4 1e-5 1e-6)
 AUGMENT=(true false)
-LRS=(1e-2 1e-3 1e-4)
+LRS=(1e-1 1e-2 1e-3 1e-4)
+WEIGHT_DECAYS=(0 1e-7 1e-5 1e-3)
 
-WIDTHS=(16 32 64)
+WIDTHS=(8 16 32 64)
 DEPTHS=(1 2 3 4)
 
 mkdir -p outputs/sweeps
@@ -26,19 +27,21 @@ for script in "${SCRIPTS[@]}"; do
                 for lr in "${LRS[@]}"; do
                     for width in "${WIDTHS[@]}"; do
                         for depth in "${DEPTHS[@]}"; do
+                            for weight_decay in "${WEIGHT_DECAYS[@]}"; do 
 
-                            run="${base}/${arch}/l1_${l1}/aug_${aug}/lr_${lr}/w${width}_d${depth}"
-                            outdir="outputs/sweeps/${run}"
-                            mkdir -p "$outdir"
+                                run="${base}/${arch}/l1_${l1}/weight_decay${weight_decay}/aug_${aug}/lr_${lr}/w${width}_d${depth}"
+                                outdir="outputs/sweeps/${run}"
+                                mkdir -p "$outdir"
 
-                            cfg="${outdir}/config.json"
+                                cfg="${outdir}/config.json"
 
-                            if [[ "$arch" == "direct_mlp" ]]; then
-                                cat > "$cfg" <<EOF
+                                if [[ "$arch" == "direct_mlp" ]]; then
+                                    cat > "$cfg" <<EOF
 {
   "architecture": "$arch",
   "learning_rate": $lr,
   "l1_regularization": $l1,
+  "weight_decay": $weight_decay,
   "augment_dataset": $aug,
   "direct_mlp_hidden_dim": $width,
   "direct_mlp_hidden_layers": $depth
@@ -50,6 +53,7 @@ EOF
   "architecture": "$arch",
   "learning_rate": $lr,
   "l1_regularization": $l1,
+  "weight_decay": $weight_decay,
   "augment_dataset": $aug,
   "kinetic_hidden_dim": $width,
   "kinetic_hidden_layers": $depth,

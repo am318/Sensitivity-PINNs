@@ -127,10 +127,10 @@ class Config:
     # Training. Adam is convenient for resolving the evolution in time.
     # Set optimizer="lbfgs" to mirror the original model_generator.py.
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 50000
+    training_steps: int = 20000
     learning_rate: float = 1e-3  # Adam default; use 1.0 for LBFGS
     weight_decay: float = 0.0
-    l1_weight: float = 1e-5
+    l1_weight: float = 1e-4
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
