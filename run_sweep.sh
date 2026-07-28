@@ -8,12 +8,12 @@ SCRIPTS=(
 )
 
 ARCHITECTURES=(direct_mlp hamiltonian)
-L1S=(0 1e-4 1e-6)
+L1S=(0 1e-3 1e-5)
 AUGMENT=(true false)
 LRS=(1e-2 1e-3 1e-4)
 
-WIDTHS=(32 64 128)
-DEPTHS=(2 3 4)
+WIDTHS=(16 32 64)
+DEPTHS=(1 2 3 4)
 
 mkdir -p outputs/sweeps
 
