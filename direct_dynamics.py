@@ -34,7 +34,7 @@ class DirectDynamicsMLP(nn.Module):
         self.q_dim = q_dim
         self.device = device or torch.device("cpu")
 
-        act = nn.Tanh()
+        act = nn.SiLU()
         layers = [nn.Linear(p_dim + q_dim + param_dim, hidden_dim), act]
         for _ in range(1, n_hidden):
             layers += [nn.Linear(hidden_dim, hidden_dim), act]
