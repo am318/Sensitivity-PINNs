@@ -46,8 +46,8 @@ def tangent_projection(
     indexes flattened (probe point, output component) pairs.
     """
     work_dtype = torch.float64
-    j = jacobian.detach().to(device="cpu", dtype=work_dtype)
-    g = target.detach().to(device="cpu", dtype=work_dtype)
+    j = jacobian.detach().cpu().to(dtype=work_dtype)
+    g = target.detach().cpu().to(dtype=work_dtype)
     u, singular_values, vh = torch.linalg.svd(j, full_matrices=False)
     if singular_values.numel() == 0 or singular_values[0] <= 0:
         keep = torch.zeros_like(singular_values, dtype=torch.bool)
@@ -97,8 +97,8 @@ def principal_angles_and_dimension(
     arccos of the singular values of the product of their orthonormal bases.
     """
     work_dtype = torch.float64
-    j = jacobian.detach().to(device="cpu", dtype=work_dtype)
-    gmat = generator_matrix.detach().to(device="cpu", dtype=work_dtype)
+    j = jacobian.detach().cpu().to(dtype=work_dtype)
+    gmat = generator_matrix.detach().cpu().to(dtype=work_dtype)
 
     u_t, s_t, _ = torch.linalg.svd(j, full_matrices=False)
     keep_t = s_t >= relative_cutoff * s_t[0] if s_t.numel() and s_t[0] > 0 else torch.zeros_like(s_t, dtype=torch.bool)
@@ -148,9 +148,9 @@ def finite_transform_residual(
     evaluated at both x and g.x rather than assuming the probe grid is closed
     under the transform.
     """
-    x = values_x.detach().to(device="cpu", dtype=torch.float64)
-    gx = values_gx.detach().to(device="cpu", dtype=torch.float64)
-    predicted = x if rep_matrix is None else x @ rep_matrix.detach().to(device="cpu", dtype=torch.float64).T
+    x = values_x.detach().cpu().to(dtype=torch.float64)
+    gx = values_gx.detach().cpu().to(dtype=torch.float64)
+    predicted = x if rep_matrix is None else x @ rep_matrix.detach().cpu().to(dtype=torch.float64).T
     residual = gx - predicted
     return float(
         torch.linalg.vector_norm(residual) / torch.linalg.vector_norm(x).clamp_min(1e-15)
@@ -168,10 +168,10 @@ def transform_defect(
     also derive per-parameter attribution (e.g. which parameters most violate
     the expected equivariance).
     """
-    jx = jacobian_x.detach().to(device="cpu", dtype=torch.float64)
-    jgx = jacobian_gx.detach().to(device="cpu", dtype=torch.float64)
+    jx = jacobian_x.detach().cpu().to(dtype=torch.float64)
+    jgx = jacobian_gx.detach().cpu().to(dtype=torch.float64)
     predicted = jx if rep_matrix is None else torch.einsum(
-        "dc,ncp->ndp", rep_matrix.detach().to(device="cpu", dtype=torch.float64), jx
+        "dc,ncp->ndp", rep_matrix.detach().cpu().to(dtype=torch.float64), jx
     )
     return jgx - predicted
 
@@ -190,7 +190,7 @@ def sensitivity_transform_residual(
     ``None`` for the identity).
     """
     defect = transform_defect(jacobian_x, jacobian_gx, rep_matrix)
-    jx = jacobian_x.detach().to(device="cpu", dtype=torch.float64)
+    jx = jacobian_x.detach().cpu().to(dtype=torch.float64)
     return float(
         torch.linalg.vector_norm(defect) / torch.linalg.vector_norm(jx).clamp_min(1e-15)
     )
@@ -210,8 +210,8 @@ def domain_parity_energy_fraction(
     diagnostic of functional form, independent of, and complementary to,
     ``sensitivity_transform_residual``'s equivariance-defect check.
     """
-    jx = jacobian_x.detach().to(device="cpu", dtype=torch.float64)
-    jflip = jacobian_flipped_x.detach().to(device="cpu", dtype=torch.float64)
+    jx = jacobian_x.detach().cpu().to(dtype=torch.float64)
+    jflip = jacobian_flipped_x.detach().cpu().to(dtype=torch.float64)
     odd_part = 0.5 * (jx - jflip)
     return float(
         torch.linalg.vector_norm(odd_part).square()
@@ -235,7 +235,7 @@ def per_parameter_equivariance_error(
     generator -- even when the function itself has learned the symmetry well.
     """
     defect = transform_defect(jacobian_x, jacobian_gx, rep_matrix)
-    jx = jacobian_x.detach().to(device="cpu", dtype=torch.float64)
+    jx = jacobian_x.detach().cpu().to(dtype=torch.float64)
     numerator = torch.linalg.vector_norm(defect, dim=(0, 1))
     denominator = torch.linalg.vector_norm(jx, dim=(0, 1)).clamp_min(1e-15)
     return numerator / denominator

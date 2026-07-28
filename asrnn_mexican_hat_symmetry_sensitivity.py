@@ -46,7 +46,9 @@ from experiment_common import (
     parameter_layout,
     plot_ei_initial_vs_final,
     plot_magnitude_vs_quantity,
+    plot_magnitude_vs_quantity,
     plot_training_history,
+    prettify_parameter_name,
     prettify_parameter_name,
     run_training_loop,
     select_device,
@@ -78,19 +80,19 @@ from sensitivity_tools import (
 
 @dataclass
 class Config:
-    seed: int = 0
+    seed: int = 42
     device: str = "auto"
     dtype: str = "float32"
     output_dir: str = "outputs/asrnn_mexican_hat_symmetry"
 
-    architecture: str = "hamiltonian"  # hamiltonian, direct_mlp, or equivariant
+    architecture: str = "mlp"  # hamiltonian, direct_mlp, or equivariant
 
     kinetic_hidden_dim: int = 50
-    kinetic_hidden_layers: int = 2
+    kinetic_hidden_layers: int = 3
     potential_hidden_dim: int = 50
-    potential_hidden_layers: int = 2
-    direct_mlp_hidden_dim: int = 50
-    direct_mlp_hidden_layers: int = 2
+    potential_hidden_layers: int = 3
+    direct_mlp_hidden_dim: int = 10
+    direct_mlp_hidden_layers: int = 1
 
     training_alphas: list[float] = field(
         default_factory=lambda: [-1.4, -1.0, -0.6, -0.2, 0.2, 0.6, 1.0, 1.4]
@@ -102,11 +104,25 @@ class Config:
     integration_dt: float = 0.1
     coarsening_factor: int = 50
     validation_fraction: float = 0.25
+    augment_dataset: bool = True
 
     optimizer: str = "adam"
-    training_steps: int = 10000
+    training_steps: int = 20000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
+    # L1 penalty on all parameters, added to the trajectory-fitting loss --
+    # tests whether an explicit sparsity pressure makes a non-equivariant
+    # architecture's parameters align more with the equivariant directions
+    # (i.e. improve sensitivity equivariance E_i) by squeezing out redundant
+    # capacity that has no reason to respect the symmetry on its own.
+    l1_weight: float = 1e-4
+    l1_regularization: float = 1e-5
+    # Checkpoints are specified as fractions of training_steps (each in
+    # [0, 1]) so they scale automatically if training_steps changes, e.g.
+    # under --quick. Resolved to absolute step indices in validate_config.
+    checkpoint_fractions: list[float] = field(
+        default_factory=lambda: [0.0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0]
+    )
     # L1 penalty on all parameters, added to the trajectory-fitting loss --
     # tests whether an explicit sparsity pressure makes a non-equivariant
     # architecture's parameters align more with the equivariant directions
@@ -116,6 +132,7 @@ class Config:
     checkpoint_steps: list[int] = field(
         default_factory=lambda: [0, 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
     )
+    checkpoint_steps: list[int] = field(default_factory=list)
     lbfgs_history_size: int = 10
 
     q_extent: float = 1.0
@@ -145,6 +162,7 @@ def parse_args() -> argparse.Namespace:
         help="Override Config.architecture.",
     )
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
+    parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     return parser.parse_args()
 
 
@@ -159,6 +177,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.architecture = args.architecture
     if args.l1_weight is not None:
         cfg.l1_weight = args.l1_weight
+    if args.l1_weight is not None:
+        cfg.l1_weight = args.l1_weight
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -167,7 +187,7 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.trajectory_splits = 2
         cfg.coarsening_factor = 2
         cfg.training_steps = 2
-        cfg.checkpoint_steps = [0, 1, 2]
+        cfg.checkpoint_fractions = [0.0, 0.5, 1.0]
         cfg.analysis_alphas = [-0.5, 0.0, 0.5]
         cfg.q_grid_points_per_axis = 4
         cfg.top_parameters_to_report = 5
@@ -186,11 +206,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("q_grid_points_per_axis must be at least 2.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
+    if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
+        raise ValueError("checkpoint_fractions must all lie in [0, 1].")
     cfg.checkpoint_steps = sorted(
-        {int(s) for s in cfg.checkpoint_steps if 0 <= int(s) <= cfg.training_steps}
+        {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
     )
-
 
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alphas, device=device, dtype=dtype)
@@ -199,6 +220,7 @@ def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
         alphas, F, total_length, cfg.trajectory_window, cfg.sampled_instants,
         dt=cfg.integration_dt, in_conds=cfg.initial_conditions_per_alpha,
         coarsening_factor=cfg.coarsening_factor, device=device, dtype=dtype,
+        augment_dataset=cfg.augment_dataset,
     )
     return train_test_split(trajectories, params, indices, val_size=cfg.validation_fraction)
 
@@ -340,6 +362,7 @@ def analyse_checkpoint(
 ) -> dict[str, Any]:
     model.eval()
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
+    parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1_grid, q2_grid = build_probe_grid(cfg, device, dtype)
     rot_mat = rotation_matrix(cfg.rotation_angle_degrees, device, dtype)
     q1_rot, q2_rot = transform_points(q1_grid, q2_grid, rot_mat)
@@ -361,7 +384,7 @@ def analyse_checkpoint(
         rotation_sensitivity_residual = sensitivity_transform_residual(j_x, j_rot, rot_mat)
         rotation_equivariance_error = per_parameter_equivariance_error(j_x, j_rot, rot_mat)
 
-        sensitivity = torch.sqrt(torch.mean(j_x.double().square(), dim=(0, 1)))
+        sensitivity = torch.sqrt(torch.mean(j_x.detach().cpu().double().square(), dim=(0, 1)))
         jac_flat = j_x.reshape(n_points * 2, -1)
 
         bifurcation_target = bifurcation_generator_target(q1_grid, q2_grid)
@@ -389,7 +412,8 @@ def analyse_checkpoint(
             (q1_grid**2 + q2_grid**2).unsqueeze(-1) * torch.stack([q1_grid, q2_grid], dim=1)
         )
         energy_conservation_violation = relative_energy_drift(
-            grad_e_p.double(), grad_e_q.double(), f_x.double(), learned_dqdt_values.double()
+            grad_e_p.detach().cpu().double(), grad_e_q.detach().cpu().double(),
+            f_x.detach().cpu().double(), learned_dqdt_values.detach().cpu().double()
         )
 
         alpha_results.append(
@@ -439,7 +463,11 @@ def analyse_checkpoint(
     return {
         "step": step,
         "parameter_magnitude": parameter_magnitude,
+        "parameter_magnitude": parameter_magnitude,
         "alpha_results": alpha_results,
+        "bifurcation_score": bifurcation_score.tolist(),
+        "xrot_score": xrot_score.tolist(),
+        "equivariance_score": equivariance_score.tolist(),
         "bifurcation_score": bifurcation_score.tolist(),
         "xrot_score": xrot_score.tolist(),
         "equivariance_score": equivariance_score.tolist(),
@@ -535,6 +563,13 @@ def _exclude_kinetic(names: list[str]) -> list[str]:
     return [n for n in names if not n.startswith("K_net.")]
 
 
+def _exclude_kinetic(names: list[str]) -> list[str]:
+    """K_net never enters the force/sensitivity Jacobian (evaluate_at_points only
+    differentiates V_net), so its S_i and E_i are trivially zero by construction --
+    not a genuine result. Drop it from diagnostic plots to avoid a misleading cluster."""
+    return [n for n in names if not n.startswith("K_net.")]
+
+
 def plot_equivariance_by_module(all_results: list[dict[str, Any]], output_dir: Path) -> None:
     first, last = all_results[0], all_results[-1]
 
@@ -543,6 +578,7 @@ def plot_equivariance_by_module(all_results: list[dict[str, Any]], output_dir: P
         return rows[len(rows) // 2]
 
     first_row, last_row = central_row(first), central_row(last)
+    modules = _exclude_kinetic(list(first_row["module_rotation_equivariance_error"].keys()))
     modules = _exclude_kinetic(list(first_row["module_rotation_equivariance_error"].keys()))
     before = [first_row["module_rotation_equivariance_error"][m] for m in modules]
     after = [last_row["module_rotation_equivariance_error"][m] for m in modules]
@@ -553,6 +589,7 @@ def plot_equivariance_by_module(all_results: list[dict[str, Any]], output_dir: P
     ax.bar(x - width / 2, before, width, label=f"step {first['step']} (random init)")
     ax.bar(x + width / 2, after, width, label=f"step {last['step']} (trained)")
     ax.set_xticks(x)
+    ax.set_xticklabels([prettify_parameter_name(m) for m in modules], rotation=60, ha="right", fontsize=8)
     ax.set_xticklabels([prettify_parameter_name(m) for m in modules], rotation=60, ha="right", fontsize=8)
     ax.set(title="Rotation sensitivity-equivariance error $E_i$ by module", ylabel="mean $E_i$ within module")
     ax.grid(alpha=0.25, axis="y")
@@ -577,6 +614,21 @@ def _alpha_averaged(checkpoint: dict[str, Any], key: str) -> np.ndarray:
     return np.mean([np.asarray(row[key]) for row in rows], axis=0)
 
 
+def _alpha_averaged(checkpoint: dict[str, Any], key: str) -> np.ndarray:
+    """Mean of a per-parameter quantity (S_i or E_i) across all analysis alphas.
+
+    A single representative alpha (e.g. the literal middle of analysis_alphas,
+    which happens to be alpha=0) is not safe to use alone: any V_net first-layer
+    weight multiplying the alpha input channel has S_i = |alpha * (downstream
+    grad)|, which is exactly zero whenever that probe alpha is exactly zero --
+    a calculus certainty, not a trained or magnitude-driven effect. Averaging
+    over every analysis alpha (which spans both signs and excludes only the
+    single alpha=0 slice from dominating) removes this probe-point artefact.
+    """
+    rows = checkpoint["alpha_results"]
+    return np.mean([np.asarray(row[key]) for row in rows], axis=0)
+
+
 def plot_equivariance_scatter(
     all_results: list[dict[str, Any]], parameter_slices: dict[str, slice], output_dir: Path
 ) -> None:
@@ -584,7 +636,12 @@ def plot_equivariance_scatter(
     ei_initial = _alpha_averaged(first, "rotation_equivariance_error_by_parameter")
     ei_final = _alpha_averaged(last, "rotation_equivariance_error_by_parameter")
     plotting_slices = {name: sl for name, sl in parameter_slices.items() if not name.startswith("K_net.")}
+    ei_initial = _alpha_averaged(first, "rotation_equivariance_error_by_parameter")
+    ei_final = _alpha_averaged(last, "rotation_equivariance_error_by_parameter")
+    plotting_slices = {name: sl for name, sl in parameter_slices.items() if not name.startswith("K_net.")}
     plot_ei_initial_vs_final(
+        ei_initial, ei_final, plotting_slices,
+        title="Rotation sensitivity-equivariance $E_i$: init vs. trained (mean over $\\alpha$)",
         ei_initial, ei_final, plotting_slices,
         title="Rotation sensitivity-equivariance $E_i$: init vs. trained (mean over $\\alpha$)",
         output_stem=output_dir / "equivariance_scatter",
@@ -753,7 +810,15 @@ def train_and_analyse(cfg: Config) -> None:
     plot_magnitude_diagnostics(all_results, parameter_slices, output_dir)
     plot_module_attribution(all_results, parameter_slices, output_dir)
     plot_attribution_scatter(all_results, parameter_slices, output_dir)
+    plot_magnitude_diagnostics(all_results, parameter_slices, output_dir)
+    plot_module_attribution(all_results, parameter_slices, output_dir)
+    plot_attribution_scatter(all_results, parameter_slices, output_dir)
     (output_dir / "all_checkpoint_results.json").write_text(json.dumps(all_results, indent=2))
+
+    model.load_state_dict(checkpoint_states[cfg.training_steps])
+    sparsity = report_sparsity(model)
+    (output_dir / "sparsity_report.json").write_text(json.dumps(sparsity, indent=2))
+    print(f"Sparsity (final checkpoint): {sparsity['fraction_below_threshold']}")
 
     model.load_state_dict(checkpoint_states[cfg.training_steps])
     sparsity = report_sparsity(model)
