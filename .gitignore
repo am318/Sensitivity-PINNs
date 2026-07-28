@@ -1,3 +1,4 @@
 outputs/*
 !.gitkeep
 __pycache__
+ASRNN_Sparse_Data
