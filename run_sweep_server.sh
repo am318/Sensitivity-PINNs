@@ -7,10 +7,8 @@ SCRIPTS=(
     "asrnn_mexican_hat_symmetry_sensitivity.py"
 )
 
-ARCHITECTURES=(direct_mlp hamiltonian)
 L1S=(0 1e-1 1e-2 1e-3 1e-4 1e-5 1e-6)
-AUGMENT=(true false)
-LRS=(1e-1 1e-2 1e-3 1e-4)
+LRS=(1e-2 1e-3 1e-4)
 WEIGHT_DECAYS=(0 1e-7 1e-5 1e-3)
 
 WIDTHS=(8 16 32 64)
@@ -23,16 +21,12 @@ task_queue=()
 for script in "${SCRIPTS[@]}"; do
     base=$(basename "$script" .py)
 
-    for arch in "${ARCHITECTURES[@]}"; do
-        for l1 in "${L1S[@]}"; do
-            for aug in "${AUGMENT[@]}"; do
-                for lr in "${LRS[@]}"; do
-                    for width in "${WIDTHS[@]}"; do
-                        for depth in "${DEPTHS[@]}"; do
-                            for weight_decay in "${WEIGHT_DECAYS[@]}"; do
-                                task_queue+=("$script"$'\t'"$base"$'\t'"$arch"$'\t'"$l1"$'\t'"$aug"$'\t'"$lr"$'\t'"$width"$'\t'"$depth"$'\t'"$weight_decay")
-                            done
-                        done
+    for l1 in "${L1S[@]}"; do
+        for lr in "${LRS[@]}"; do
+            for width in "${WIDTHS[@]}"; do
+                for depth in "${DEPTHS[@]}"; do
+                    for weight_decay in "${WEIGHT_DECAYS[@]}"; do
+                        task_queue+=("$script"$'\t'"$base"$'\t'"$l1"$'\t'"$lr"$'\t'"$width"$'\t'"$depth"$'\t'"$weight_decay")
                     done
                 done
             done
@@ -68,16 +62,14 @@ run_job() {
     local gpu="$1"
     local script="$2"
     local base="$3"
-    local arch="$4"
     local l1="$5"
-    local aug="$6"
     local lr="$7"
     local width="$8"
     local depth="$9"
     local weight_decay="${10}"
 
     local run outdir cfg
-    run="${base}/${arch}/l1_${l1}/weight_decay_${weight_decay}/aug_${aug}/lr_${lr}/w${width}_d${depth}"
+    run="${base}/l1_${l1}/weight_decay_${weight_decay}/lr_${lr}/w${width}_d${depth}"
     outdir="outputs/sweeps/${run}"
     mkdir -p "$outdir"
 
@@ -86,11 +78,9 @@ run_job() {
     if [[ "$arch" == "direct_mlp" ]]; then
         cat > "$cfg" <<EOF
 {
-  "architecture": "$arch",
   "learning_rate": $lr,
   "l1_weight": $l1,
   "weight_decay": $weight_decay,
-  "augment_dataset": $aug,
   "direct_mlp_hidden_dim": $width,
   "direct_mlp_hidden_layers": $depth
 }
@@ -98,11 +88,9 @@ EOF
     else
         cat > "$cfg" <<EOF
 {
-  "architecture": "$arch",
   "learning_rate": $lr,
   "l1_weight": $l1,
   "weight_decay": $weight_decay,
-  "augment_dataset": $aug,
   "kinetic_hidden_dim": $width,
   "kinetic_hidden_layers": $depth,
   "potential_hidden_dim": $width,
@@ -123,7 +111,7 @@ worker() {
 
     while job="$(get_next_job)"; do
         IFS=$'\t' read -r script base arch l1 aug lr width depth weight_decay <<< "$job"
-        run_job "$gpu" "$script" "$base" "$arch" "$l1" "$aug" "$lr" "$width" "$depth" "$weight_decay"
+        run_job "$gpu" "$script" "$base" "$l1" "$lr" "$width" "$depth" "$weight_decay"
     done
 
     echo "[GPU ${gpu}] Done"
