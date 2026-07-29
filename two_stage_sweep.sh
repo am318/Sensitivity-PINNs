@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Usage: bash run_sweep.sh
 #   Runs Stage 1 (arch_pilot: coarse width/depth search) to completion, then
-#   automatically runs Stage 2 (main: full L1/LR/weight-decay grid at the
-#   representative sizes set in SIZES below).
+#   automatically runs Stage 2 (main: full LR/weight-decay grid at the
+#   representative sizes set in SIZES below), with L1 held constant.
 
 SCRIPTS=(
 # "asrnn_double_well_bifurcation_sensitivity.py"
@@ -17,25 +17,27 @@ SCRIPTS=(
 # representative capacities before spending budget on the full reg/LR grid.
 PILOT_LR=1e-3
 PILOT_L1=0
-PILOT_WEIGHT_DECAY=0
+PILOT_WEIGHT_DECAY=1e-3
 WIDTHS=(8 16 32 64)
 DEPTHS=(1 2 3 4)
 
 # --- Stage 2: main regularization/LR grid -----------------------------------
-# Run the full L1/LR/weight-decay grid only at a small number of representative
+# Run the LR/weight-decay grid only at a small number of representative
 # capacities (chosen from the Stage 1 pilot), rather than the full width/depth
-# cross product. Edit these once the pilot results are in, then re-run.
+# cross product. L1 is held constant.
 SIZES=(
 "16 2"   # representative "small" capacity: width depth
 "64 4"   # representative "large" capacity: width depth
 )
 
+# Fixed L1 value for the main sweep.
+MAIN_L1=0
+
 # Trimmed grids: dropped values that are empirically indistinguishable from 0
-# (e.g. weight_decay=1e-7, l1=1e-5/1e-6) and log-spaced the rest so each point
-# is expected to actually change behavior.
-L1S=(0 1e-1 1e-2 1e-3 1e-4)
+# (e.g. weight_decay=1e-7) and log-spaced the rest so each point is expected to
+# actually change behavior.
 LRS=(1e-2 1e-3 1e-4)
-WEIGHT_DECAYS=(0 1e-4 1e-3 1e-2)
+WEIGHT_DECAYS=(0 1e-5 1e-4 1e-3 1e-2 1e-1)
 
 mkdir -p outputs/sweeps
 
@@ -59,11 +61,9 @@ done
 elif [[ "$stage" == "main" ]]; then
 for size in "${SIZES[@]}"; do
 read -r width depth <<< "$size"
-for l1 in "${L1S[@]}"; do
 for lr in "${LRS[@]}"; do
 for weight_decay in "${WEIGHT_DECAYS[@]}"; do
-task_queue+=("$script"$'\t'"$base"$'\t'"$l1"$'\t'"$lr"$'\t'"$width"$'\t'"$depth"$'\t'"$weight_decay")
-done
+task_queue+=("$script"$'\t'"$base"$'\t'"$MAIN_L1"$'\t'"$lr"$'\t'"$width"$'\t'"$depth"$'\t'"$weight_decay")
 done
 done
 done
