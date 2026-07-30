@@ -75,6 +75,7 @@ from sensitivity_tools import (
     relative_energy_drift,
     sensitivity_transform_residual,
     tangent_projection,
+    parameter_magnitude_ci_correlation,
 )
 
 
@@ -87,9 +88,9 @@ class Config:
 
     architecture: str = "hamiltonian"  # hamiltonian, direct_mlp, or equivariant
 
-    kinetic_hidden_dim: int = 50
+    kinetic_hidden_dim: int = 32
     kinetic_hidden_layers: int = 3
-    potential_hidden_dim: int = 50
+    potential_hidden_dim: int = 32
     potential_hidden_layers: int = 3
     direct_mlp_hidden_dim: int = 32
     direct_mlp_hidden_layers: int = 3
@@ -97,8 +98,8 @@ class Config:
     training_alphas: list[float] = field(
         default_factory=lambda: [-1.1, -0.8, -0.6, -0.2, 0.2, 0.6, 0.8, 1.1]
     )
-    trajectory_window: int = 15
-    trajectory_splits: int = 7
+    trajectory_window: int = 100
+    trajectory_splits: int = 50
     sampled_instants: int = 5
     initial_conditions_per_alpha: int = 8
     integration_dt: float = 0.1
@@ -112,15 +113,15 @@ class Config:
     augment_dataset: bool = False
 
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 10000
+    training_steps: int = 100000
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-3
+    weight_decay: float = 0.0
     # L1 penalty on all parameters, added to the trajectory-fitting loss --
     # tests whether an explicit sparsity pressure makes a non-equivariant
     # architecture's parameters align more with the equivariant directions
     # (i.e. improve sensitivity equivariance E_i) by squeezing out redundant
     # capacity that has no reason to respect the symmetry on its own.
-    l1_weight: float = 0.0
+    l1_weight: float = 1e-5
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
@@ -527,6 +528,23 @@ def analyse_checkpoint(
     energy_attribution_score = np.sqrt(np.mean(energy_attribution_matrix**2, axis=0))
 
     vnet_mask = np.array([name.startswith("V_net.") for name in flat_names])
+
+    xrot_mag_corr = parameter_magnitude_ci_correlation(
+        parameter_magnitude,
+        xrot_score,
+        mask=vnet_mask,
+    )
+
+    energy_mag_corr = parameter_magnitude_ci_correlation(
+        parameter_magnitude,
+        energy_attribution_score,
+    )
+
+    equivariance_mag_corr = parameter_magnitude_ci_correlation(
+        parameter_magnitude,
+        equivariance_score,
+        mask=vnet_mask,
+    )
     return {
         "step": step,
         "parameter_magnitude": parameter_magnitude,
@@ -537,6 +555,9 @@ def analyse_checkpoint(
         "energy_attribution_score": energy_attribution_score.tolist(),
         "xrot_participation_ratio": participation_ratio(xrot_score[vnet_mask]),
         "energy_participation_ratio": participation_ratio(energy_attribution_score),
+        "xrot_magnitude_correlation": xrot_mag_corr,
+        # "energy_magnitude_correlation": energy_mag_corr,
+        # "equivariance_magnitude_correlation": equivariance_mag_corr,
         "top_bifurcation_parameters": [
             {"flat_index": int(i), "name": flat_names[i], "rms_coefficient": float(bifurcation_score[i])}
             for i in top_bifurcation
@@ -1095,6 +1116,18 @@ def train_and_analyse(cfg: Config) -> None:
     plot_learned_potential(model, cfg, device, dtype, output_dir)
     sparsity = report_sparsity(model)
     (output_dir / "sparsity_report.json").write_text(json.dumps(sparsity, indent=2))
+
+    # Training Quality Report
+    summary = {
+    "xrot_magnitude_correlation": all_results[-1]["xrot_magnitude_correlation"],
+    "xrot_participation_ratio": all_results[-1]["xrot_participation_ratio"],
+    "sparsity_report": sparsity,
+}
+
+    (output_dir / "xrot_sparsity_summary.json").write_text(
+        json.dumps(summary, indent=2)
+    )
+
     print(f"Sparsity (final checkpoint): {sparsity['fraction_below_threshold']}")
     print(
         f"Final rotation attribution PR: {all_results[-1]['xrot_participation_ratio']:.2f}; "

@@ -317,3 +317,51 @@ def relative_energy_drift(
     q_term_scale = torch.linalg.vector_norm(grad_e_q, dim=-1) * torch.linalg.vector_norm(dqdt, dim=-1)
     scale = torch.sqrt(torch.mean((p_term_scale + q_term_scale) ** 2)).clamp_min(1e-15)
     return float(torch.sqrt(torch.mean(drift**2)) / scale)
+
+def parameter_magnitude_ci_correlation(
+    parameter_magnitude,
+    ci,
+    *,
+    mask: np.ndarray | None = None,
+) -> float:
+    """
+    Pearson correlation between parameter magnitude |theta_i| and a
+    per-parameter quantity (e.g. attribution coefficients, confidence
+    interval, or other CI measure).
+
+    Parameters
+    ----------
+    parameter_magnitude : array-like
+        |theta_i| for every parameter.
+    ci : array-like
+        Per-parameter quantity of the same length.
+    mask : array-like of bool, optional
+        Boolean mask selecting parameters to include
+        (e.g. only V_net parameters).
+
+    Returns
+    -------
+    float
+        Pearson correlation coefficient in [-1, 1]. Returns NaN if the
+        correlation is undefined.
+    """
+    magnitude = np.asarray(parameter_magnitude, dtype=float)
+    ci = np.asarray(ci, dtype=float)
+
+    if magnitude.shape != ci.shape:
+        raise ValueError("parameter_magnitude and ci must have the same shape.")
+
+    valid = np.isfinite(magnitude) & np.isfinite(ci)
+    if mask is not None:
+        valid &= np.asarray(mask, dtype=bool)
+
+    magnitude = magnitude[valid]
+    ci = ci[valid]
+
+    if magnitude.size < 2:
+        return np.nan
+
+    if np.std(magnitude) == 0 or np.std(ci) == 0:
+        return np.nan
+
+    return float(np.corrcoef(magnitude, ci)[0, 1])

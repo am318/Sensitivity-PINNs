@@ -1,125 +1,103 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPTS=(
-    # "asrnn_double_well_bifurcation_sensitivity.py"
-    # "asrnn_henon_heiles_symmetry_sensitivity.py"
-    "asrnn_mexican_hat_symmetry_sensitivity.py"
-)
+# Hyperparameter sweep centered on the defaults in
+# asrnn_mexican_hat_symmetry_sensitivity.py:
+#   learning_rate = 1e-3
+#   weight_decay  = 0.0
+#   l1_weight     = 1e-5
+#
+# This script sweeps only those three knobs.
 
-L1S=(0 1e-1 1e-2 1e-3 1e-4 1e-5 1e-6)
-LRS=(1e-2 1e-3 1e-4)
-WEIGHT_DECAYS=(0 1e-7 1e-5 1e-3)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODEL_SCRIPT="${SCRIPT_DIR}/asrnn_mexican_hat_symmetry_sensitivity.py"
+OUTPUT_ROOT="${SCRIPT_DIR}/outputs/sweeps/mexican_hat_centered"
 
-WIDTHS=(8 16 32 64)
-DEPTHS=(1 2 3 4)
+# Centered, log-spaced grid around the defaults.
+LRS=(5e-4 1e-3 5e-3)
+WEIGHT_DECAYS=(0 1e-7 1e-6 1e-5 1e-4)
+L1S=(1e-6 1e-5 1e-4)
 
-mkdir -p outputs/sweeps
+# Use up to four GPUs by default; edit this list if needed.
+GPU_IDS=(0 1 2 3)
 
-# Build the full queue of jobs.
-task_queue=()
-for script in "${SCRIPTS[@]}"; do
-    base=$(basename "$script" .py)
+mkdir -p "$OUTPUT_ROOT"
 
+# Build the job queue as tab-separated records:
+# script <tab> lr <tab> weight_decay <tab> l1
+job_queue=()
+for lr in "${LRS[@]}"; do
+  for weight_decay in "${WEIGHT_DECAYS[@]}"; do
     for l1 in "${L1S[@]}"; do
-        for lr in "${LRS[@]}"; do
-            for width in "${WIDTHS[@]}"; do
-                for depth in "${DEPTHS[@]}"; do
-                    for weight_decay in "${WEIGHT_DECAYS[@]}"; do
-                        task_queue+=("$script"$'\t'"$base"$'\t'"$l1"$'\t'"$lr"$'\t'"$width"$'\t'"$depth"$'\t'"$weight_decay")
-                    done
-                done
-            done
-        done
+      job_queue+=("${MODEL_SCRIPT}"$'\t'"${lr}"$'\t'"${weight_decay}"$'\t'"${l1}")
     done
+  done
 done
 
-job_count=${#task_queue[@]}
+job_count=${#job_queue[@]}
 next_job_file=$(mktemp)
 lock_file=$(mktemp)
 trap 'rm -f "$next_job_file" "$lock_file"' EXIT
-echo 0 > "$next_job_file"
+printf '0\n' > "$next_job_file"
 
 get_next_job() {
-    local idx
+  local idx
 
-    exec 9>"$lock_file"
-    flock 9
+  exec 9>"$lock_file"
+  flock 9
 
-    idx=$(<"$next_job_file")
-    if (( idx >= job_count )); then
-        flock -u 9
-        return 1
-    fi
-
-    printf '%s\n' "${task_queue[idx]}"
-    echo $((idx + 1)) > "$next_job_file"
-
+  idx=$(<"$next_job_file")
+  if (( idx >= job_count )); then
     flock -u 9
+    return 1
+  fi
+
+  printf '%s\n' "${job_queue[idx]}"
+  printf '%s\n' "$((idx + 1))" > "$next_job_file"
+
+  flock -u 9
 }
 
 run_job() {
-    local gpu="$1"
-    local script="$2"
-    local base="$3"
-    local l1="$5"
-    local lr="$7"
-    local width="$8"
-    local depth="$9"
-    local weight_decay="${10}"
+  local gpu="$1"
+  local script="$2"
+  local lr="$3"
+  local weight_decay="$4"
+  local l1="$5"
 
-    local run outdir cfg
-    run="${base}/l1_${l1}/weight_decay_${weight_decay}/lr_${lr}/w${width}_d${depth}"
-    outdir="outputs/sweeps/${run}"
-    mkdir -p "$outdir"
+  local run_dir cfg
+  run_dir="lr_${lr}/weight_decay_${weight_decay}/l1_${l1}"
+  cfg="${OUTPUT_ROOT}/${run_dir}/config.json"
+  mkdir -p "$(dirname "$cfg")"
 
-    cfg="${outdir}/config.json"
-
-    if [[ "$arch" == "direct_mlp" ]]; then
-        cat > "$cfg" <<EOF
+  cat > "$cfg" <<EOF_CFG
 {
-  "learning_rate": $lr,
-  "l1_weight": $l1,
-  "weight_decay": $weight_decay,
-  "direct_mlp_hidden_dim": $width,
-  "direct_mlp_hidden_layers": $depth
+  "learning_rate": ${lr},
+  "weight_decay": ${weight_decay},
+  "l1_weight": ${l1}
 }
-EOF
-    else
-        cat > "$cfg" <<EOF
-{
-  "learning_rate": $lr,
-  "l1_weight": $l1,
-  "weight_decay": $weight_decay,
-  "kinetic_hidden_dim": $width,
-  "kinetic_hidden_layers": $depth,
-  "potential_hidden_dim": $width,
-  "potential_hidden_layers": $depth
-}
-EOF
-    fi
+EOF_CFG
 
-    echo "[GPU ${gpu}] Running ${run}"
-    CUDA_VISIBLE_DEVICES="$gpu" python "$script" \
-        --config "$cfg" \
-        --output-dir "$outdir"
+  echo "[GPU ${gpu}] lr=${lr} wd=${weight_decay} l1=${l1}"
+  CUDA_VISIBLE_DEVICES="$gpu" python "$script" \
+    --config "$cfg" \
+    --output-dir "${OUTPUT_ROOT}/${run_dir}"
 }
 
 worker() {
-    local gpu="$1"
-    local job
+  local gpu="$1"
+  local job
 
-    while job="$(get_next_job)"; do
-        IFS=$'\t' read -r script base arch l1 aug lr width depth weight_decay <<< "$job"
-        run_job "$gpu" "$script" "$base" "$l1" "$lr" "$width" "$depth" "$weight_decay"
-    done
+  while job="$(get_next_job)"; do
+    IFS=$'\t' read -r script lr weight_decay l1 <<< "$job"
+    run_job "$gpu" "$script" "$lr" "$weight_decay" "$l1"
+  done
 
-    echo "[GPU ${gpu}] Done"
+  echo "[GPU ${gpu}] done"
 }
 
-# Start 4 GPU workers.
-for gpu in 0 1 2 3; do
-    worker "$gpu" &
+for gpu in "${GPU_IDS[@]}"; do
+  worker "$gpu" &
 done
 
 wait
