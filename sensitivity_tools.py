@@ -16,6 +16,7 @@ matrix (e.g. a rotation).
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 
@@ -239,6 +240,25 @@ def per_parameter_equivariance_error(
     numerator = torch.linalg.vector_norm(defect, dim=(0, 1))
     denominator = torch.linalg.vector_norm(jx, dim=(0, 1)).clamp_min(1e-15)
     return numerator / denominator
+
+
+def participation_ratio(values) -> float:
+    """Effective number of entries carrying a per-parameter quantity (e.g. attribution c_i).
+
+    PR = (sum v_i^2)^2 / sum v_i^4, a standard localisation-theory summary:
+    PR = k if the "mass" v_i^2 is spread evenly over exactly k entries and
+    zero elsewhere; PR = 1 if a single entry carries everything. Robust to
+    counting "nonzero" entries directly, which is useless once L1/pruning
+    leaves almost nothing exactly zero at floating-point precision -- PR
+    instead answers "effectively how many parameters does this attribution
+    actually live on," independent of how many are technically nonzero.
+    """
+    v = np.asarray(values, dtype=np.float64)
+    sq = v**2
+    denom = float(np.sum(sq**2))
+    if denom <= 0:
+        return 0.0
+    return float(np.sum(sq) ** 2 / denom)
 
 
 def aggregate_by_module(values: torch.Tensor, slices: dict[str, slice]) -> dict[str, float]:

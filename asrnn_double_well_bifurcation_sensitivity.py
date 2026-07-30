@@ -95,7 +95,7 @@ class Config:
     # step). "direct_mlp": one plain MLP outputting (dp/dt, dq/dt) directly,
     # integrated with the same kick-drift-kick step shape but with no
     # conservation structure at all (Experiment 2's architecture comparison).
-    architecture: str = "direct_mlp"  # hamiltonian or direct_mlp
+    architecture: str = "hamiltonian"  # hamiltonian or direct_mlp
 
     # ASRNN Hamiltonian network. V_net receives (q, alpha); K_net receives p.
     kinetic_hidden_dim: int = 50
@@ -122,15 +122,18 @@ class Config:
     noise_standard_deviation: float = 0
     noise_correlation_time: float = 0
     validation_fraction: float = 0.25
-    augment_dataset: bool = True
+    # Doubles the training set with a parity-flipped copy of every trajectory --
+    # since V(-q)=V(q) exactly for this system, (p,q)->(-p,-q) is an exact symmetry
+    # of the true dynamics for every alpha, so this is free, exactly-valid additional
+    # data teaching the Z2 parity implicitly through data diversity.
+    augment_dataset: bool = False
 
     # Training. Adam is convenient for resolving the evolution in time.
     # Set optimizer="lbfgs" to mirror the original model_generator.py.
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 20000
+    training_steps: int = 10000
     learning_rate: float = 1e-3  # Adam default; use 1.0 for LBFGS
     weight_decay: float = 0.0
-    l1_weight: float = 1e-4
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
@@ -176,6 +179,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--architecture", choices=["hamiltonian", "direct_mlp"], help="Override Config.architecture."
     )
+    parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
+    parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
     return parser.parse_args()
 
 
@@ -188,6 +193,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.output_dir = args.output_dir
     if args.architecture:
         cfg.architecture = args.architecture
+    if args.augment_dataset is not None:
+        cfg.augment_dataset = args.augment_dataset
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -228,18 +235,33 @@ def validate_config(cfg: Config) -> None:
         | {0, cfg.training_steps}
     )
 
+
+def augment_with_parity(trajectories: torch.Tensor) -> torch.Tensor:
+    """Double a trajectory batch with a parity-flipped copy: (p, q) -> (-p, -q).
+
+    ``trajectories`` has layout ``[T, batch, 2]`` = ``[p, q]``. Since
+    V(-q)=V(q) exactly (F(p,q,alpha) = -alpha*q - q**3, odd in q), negating
+    the whole trajectory gives another exactly valid trajectory of the same
+    system for every alpha -- not applied per-timestep independently, since
+    the parity flip is a symmetry of the whole trajectory, not a single
+    point (dq/dt=p is preserved: d(-q)/dt = -p).
+    """
+    return -trajectories
+
+
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alphas, device=device, dtype=dtype)
     total_length = cfg.trajectory_splits + cfg.trajectory_window - 1
-
     noise_variance_fraction = cfg.noise_standard_deviation**2
     if cfg.noise_standard_deviation > 0:
         if cfg.noise_correlation_time <= 0:
-            raise ValueError("noise_correlation_time must be positive when noise is enabled.")
+            raise ValueError(
+                "noise_correlation_time must be positive when noise is enabled."
+            )
         theta = 1.0 / cfg.noise_correlation_time
     else:
+        # generate_data ignores theta when apply_ou_noise=False.
         theta = 0.0
-
     trajectories, params, indices = generate_data(
         alphas,
         F,
@@ -256,12 +278,17 @@ def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
         device=device,
         dtype=dtype,
         seed_ou=cfg.seed,
-        augment_dataset=cfg.augment_dataset
     )
-
+    if cfg.augment_dataset:
+        trajectories = torch.cat((trajectories, augment_with_parity(trajectories)), dim=1)
+        params = torch.cat((params, params), dim=0)
+        indices = torch.cat((indices, indices), dim=0)
+        perm = torch.randperm(trajectories.size(1), device=trajectories.device)
+        trajectories, params, indices = trajectories[:, perm, :], params[perm], indices[perm]
     return train_test_split(
         trajectories, params, indices, val_size=cfg.validation_fraction
     )
+
 
 def build_model(cfg: Config, device: torch.device, dtype: torch.dtype):
     if cfg.architecture == "direct_mlp":
@@ -884,7 +911,7 @@ def train_and_analyse(cfg: Config) -> None:
         trajectory_window=cfg.trajectory_window,
         residuals_fn=residuals_fn,
         integrator=integrator,
-        l1_weight=cfg.l1_weight,
+        weight_decay=cfg.weight_decay,
     )
 
     torch.save(model.state_dict(), output_dir / "final_model.pt")

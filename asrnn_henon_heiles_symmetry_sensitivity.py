@@ -47,6 +47,7 @@ from experiment_common import (
     parameter_layout,
     plot_ei_initial_vs_final,
     plot_training_history,
+    prettify_parameter_name,
     run_training_loop,
     select_device,
     select_dtype,
@@ -58,6 +59,7 @@ from sensitivity_tools import (
     aggregate_by_module_mean,
     finite_transform_residual,
     parameter_gradient_row,
+    participation_ratio,
     per_parameter_equivariance_error,
     relative_energy_drift,
     sensitivity_transform_residual,
@@ -99,9 +101,9 @@ class Config:
 
     # ASRNN Hamiltonian network. V_net receives (q1, q2, alpha1, alpha2); K_net receives (p1, p2).
     kinetic_hidden_dim: int = 50
-    kinetic_hidden_layers: int = 2
+    kinetic_hidden_layers: int = 3
     potential_hidden_dim: int = 50
-    potential_hidden_layers: int = 2
+    potential_hidden_layers: int = 3
 
     # direct_mlp architecture only.
     direct_mlp_hidden_dim: int = 50
@@ -123,14 +125,19 @@ class Config:
     noise_standard_deviation: float = 0
     noise_correlation_time: float = 0
     validation_fraction: float = 0.25
-    augment_dataset: bool = True
+    # Doubles the training set with a q1-reflected copy of every trajectory --
+    # (p1,q1)->(-p1,-q1), (p2,q2) unchanged, is exact for *every* (alpha1,alpha2)
+    # pair (V depends on q1 only through q1**2, unlike the C3 rotation, which is
+    # only exact on the symmetric diagonal alpha1=alpha2) -- verified numerically
+    # before use, so only this always-valid symmetry is used for augmentation.
+    augment_dataset: bool = False
 
     # Training. Adam is convenient for resolving the evolution in time.
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 50000
+    training_steps: int = 10000
     learning_rate: float = 1e-3
-    weight_decay: float = 0.0
-    l1_weight: float = 1e-5
+    weight_decay: float = 1e-2
+    l1_weight: float = 0
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
@@ -139,7 +146,7 @@ class Config:
     )
     checkpoint_steps: list[int] = field(default_factory=list)
     lbfgs_history_size: int = 10
-
+    
     # Functional sensitivity probe: a 2D (q1, q2) grid.
     q_extent: float = 1.0
     q_grid_points_per_axis: int = 7
@@ -178,6 +185,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--architecture", choices=["hamiltonian", "direct_mlp"], help="Override Config.architecture."
     )
+    parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
+    parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
+    parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     return parser.parse_args()
 
 
@@ -188,6 +198,10 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.device = args.device
     if args.output_dir:
         cfg.output_dir = args.output_dir
+    if args.augment_dataset is not None:
+        cfg.augment_dataset = args.augment_dataset
+    if args.l1_weight is not None:
+        cfg.l1_weight = args.l1_weight
     if args.architecture:
         cfg.architecture = args.architecture
     if args.quick:
@@ -219,11 +233,25 @@ def validate_config(cfg: Config) -> None:
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
     if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
-        raise ValueError("checkpoint_fractions must all lie in [0, 1].")
+            raise ValueError("checkpoint_fractions must all lie in [0, 1].")
     cfg.checkpoint_steps = sorted(
         {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
     )
+
+def augment_with_reflection(trajectories: torch.Tensor) -> torch.Tensor:
+    """Double a trajectory batch with a q1-reflected copy: (p1,q1)->(-p1,-q1), (p2,q2) unchanged.
+
+    ``trajectories`` has layout ``[T, batch, 4]`` = ``[p1, p2, q1, q2]``. Exact
+    for every (alpha1, alpha2) pair, since V depends on q1 only through
+    q1**2 -- unlike the C3 rotation, which is only exact on the symmetric
+    diagonal alpha1=alpha2, so only this always-valid symmetry is used here.
+    """
+    reflected = trajectories.clone()
+    reflected[:, :, 0] = -trajectories[:, :, 0]
+    reflected[:, :, 2] = -trajectories[:, :, 2]
+    return reflected
+
 
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alpha_pairs, device=device, dtype=dtype)
@@ -244,8 +272,13 @@ def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
         device=device,
         dtype=dtype,
         seed_ou=cfg.seed,
-        augment_dataset=cfg.augment_dataset,
     )
+    if cfg.augment_dataset:
+        trajectories = torch.cat((trajectories, augment_with_reflection(trajectories)), dim=1)
+        params = torch.cat((params, params), dim=0)
+        indices = torch.cat((indices, indices), dim=0)
+        perm = torch.randperm(trajectories.size(1), device=trajectories.device)
+        trajectories, params, indices = trajectories[:, perm, :], params[perm], indices[perm]
     return train_test_split(trajectories, params, indices, val_size=cfg.validation_fraction)
 
 
@@ -307,6 +340,36 @@ def coupling_generator_target(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tenso
     return torch.stack([-2.0 * q1 * q2, q2**2 - q1**2], dim=1)
 
 
+ROTATION_LIE_GENERATOR = torch.tensor([[0.0, -1.0], [1.0, 0.0]])  # d/dtheta R_theta |_0
+
+
+def rotation_generator_target_NEGATIVE_CONTROL(
+    q1: torch.Tensor, q2: torch.Tensor, force: torch.Tensor, spatial_jacobian: torch.Tensor
+) -> torch.Tensor:
+    """X_rot F = (dF/dq)(Omega q) - Omega F(q) -- a DELIBERATE negative control, not a symmetry test.
+
+    This is the same infinitesimal-rotation construction sec. 0's erratum
+    found invalid for this system (verified again here: relative magnitude
+    ~2.7 at alpha1=alpha2=1, nonzero even on the symmetric diagonal where the
+    *discrete* C3 rotation is exact -- a continuous group has no valid
+    generator unless the symmetry is genuinely continuous, which this system
+    is not). It is reintroduced here *on purpose*, precisely because it is
+    known to be invalid: unlike the erratum (which mistakenly treated a small
+    X_rot F as evidence of learned rotational symmetry), the point here is to
+    test whether the *attribution* c_i built from this generator -- via the
+    exact same tangent_projection machinery used for the Mexican-hat's
+    genuine rotation attribution -- shows the same "concentrated on a few
+    parameters" pattern even though there is no real symmetry underneath. If
+    it does, that pattern is a generic property of the projection method
+    (tangent-space redundancy/rank structure), not evidence of symmetry
+    learning specifically -- see SYMMETRY_SENSITIVITY_NOTES.md.
+    """
+    omega_q = torch.stack([-q2, q1], dim=1)
+    directional = torch.einsum("nkj,nj->nk", spatial_jacobian, omega_q)
+    omega = ROTATION_LIE_GENERATOR.to(device=force.device, dtype=force.dtype)
+    return directional - force @ omega.T
+
+
 def evaluate_at_points(
     model: torch.nn.Module,
     q1_pts: torch.Tensor,
@@ -317,17 +380,19 @@ def evaluate_at_points(
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Evaluate learned potential, force, and force-parameter Jacobian at each (q1, q2) point.
+    need_spatial_jacobian: bool = False,
+):
+    """Evaluate learned potential, force, force-parameter Jacobian (and optionally dF/dq) at each point.
 
-    Returns ``(V, F, J)`` with shapes ``[N]``, ``[N, 2]``, ``[N, 2, P]``. There
-    is no V_net for ``architecture="direct_mlp"``, so V is NaN there (force
-    is read directly from the model's own dp/dt output at a fixed reference
-    momentum p=(0,0), the same architectural fact that makes the Hamiltonian
-    net's force independent of p).
+    Returns ``(V, F, J[, spatial_J])`` with shapes ``[N]``, ``[N, 2]``,
+    ``[N, 2, P]`` (``[N, 2, 2]`` for spatial_J). There is no V_net for
+    ``architecture="direct_mlp"``, so V is NaN there (force is read directly
+    from the model's own dp/dt output at a fixed reference momentum
+    p=(0,0), the same architectural fact that makes the Hamiltonian net's
+    force independent of p).
     """
     params = tuple(model.parameters())
-    v_values, f_values, jac_rows = [], [], []
+    v_values, f_values, jac_rows, spatial_jacs = [], [], [], []
     for q1_val, q2_val in zip(q1_pts.detach().cpu().tolist(), q2_pts.detach().cpu().tolist()):
         q = torch.tensor([[q1_val, q2_val]], device=device, dtype=dtype, requires_grad=True)
         alpha = torch.tensor([[alpha1, alpha2]], device=device, dtype=dtype)
@@ -344,11 +409,16 @@ def evaluate_at_points(
         row1 = parameter_gradient_row(force[1], params)
         f_values.append(force.detach())
         jac_rows.append(torch.stack([row0, row1]))
-    return (
-        torch.tensor(v_values, device=device, dtype=dtype),
-        torch.stack(f_values),
-        torch.stack(jac_rows),
-    )
+        if need_spatial_jacobian:
+            d_f1_dq = torch.autograd.grad(force[0], q, retain_graph=True)[0].squeeze(0)
+            d_f2_dq = torch.autograd.grad(force[1], q, retain_graph=False)[0].squeeze(0)
+            spatial_jacs.append(torch.stack([d_f1_dq, d_f2_dq]).detach())
+    v = torch.tensor(v_values, device=device, dtype=dtype)
+    f = torch.stack(f_values)
+    j = torch.stack(jac_rows)
+    if need_spatial_jacobian:
+        return v, f, j, torch.stack(spatial_jacs)
+    return v, f, j
 
 
 def learned_dqdt(
@@ -416,8 +486,9 @@ def analyse_checkpoint(
 
     alpha_results = []
     for alpha1, alpha2, tag in tqdm(alpha_pairs, desc=f"analysing step {step}", leave=False):
-        v_x, f_x, j_x = evaluate_at_points(
-            model, q1_grid, q2_grid, alpha1, alpha2, cfg.architecture, device=device, dtype=dtype
+        v_x, f_x, j_x, spatial_jac_x = evaluate_at_points(
+            model, q1_grid, q2_grid, alpha1, alpha2, cfg.architecture,
+            device=device, dtype=dtype, need_spatial_jacobian=True,
         )
         v_rot, f_rot, j_rot = evaluate_at_points(
             model, q1_rot, q2_rot, alpha1, alpha2, cfg.architecture, device=device, dtype=dtype
@@ -499,12 +570,44 @@ def analyse_checkpoint(
                     ),
                 }
             )
+
+            # NEGATIVE CONTROL (see rotation_generator_target_NEGATIVE_CONTROL's
+            # docstring): this system has no continuous rotational symmetry, so
+            # X_rot F is large and nonzero even here, on the symmetric diagonal.
+            # Attributed via the identical tangent_projection machinery as the
+            # valid coupling generator above, purely to test whether a
+            # "concentrated on a few parameters" attribution pattern appears
+            # regardless of whether a real symmetry exists.
+            xrot_target = rotation_generator_target_NEGATIVE_CONTROL(q1_grid, q2_grid, f_x, spatial_jac_x)
+            xrot_target_flat = xrot_target.reshape(n_points * 2)
+            (
+                xrot_control_projection_error,
+                xrot_control_principal_angle,
+                xrot_control_coefficients,
+                xrot_control_resolved_rank,
+                xrot_control_singular_values,
+            ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
+            result.update(
+                {
+                    "xrot_control_projection_error": xrot_control_projection_error,
+                    "xrot_control_principal_angle_degrees": xrot_control_principal_angle,
+                    "xrot_control_resolved_rank": xrot_control_resolved_rank,
+                    "xrot_control_singular_values": xrot_control_singular_values,
+                    "xrot_control_attribution_coefficients": xrot_control_coefficients.cpu().tolist(),
+                    "module_xrot_control_attribution": aggregate_by_module(
+                        xrot_control_coefficients.abs(), parameter_slices
+                    ),
+                }
+            )
         alpha_results.append(result)
 
     symmetric_results = [r for r in alpha_results if r["tag"] == "symmetric"]
     coefficient_matrix = np.asarray([r["coupling_attribution_coefficients"] for r in symmetric_results])
     coupling_score = np.sqrt(np.mean(coefficient_matrix**2, axis=0))
     top_coupling = np.argsort(coupling_score)[::-1][: cfg.top_parameters_to_report]
+
+    xrot_control_matrix = np.asarray([r["xrot_control_attribution_coefficients"] for r in symmetric_results])
+    xrot_control_score = np.sqrt(np.mean(xrot_control_matrix**2, axis=0))
 
     equivariance_matrix = np.asarray(
         [r["rotation_equivariance_error_by_parameter"] for r in alpha_results]
@@ -515,6 +618,10 @@ def analyse_checkpoint(
     return {
         "step": step,
         "alpha_results": alpha_results,
+        "coupling_score": coupling_score.tolist(),
+        "xrot_control_score": xrot_control_score.tolist(),
+        "coupling_participation_ratio": participation_ratio(coupling_score),
+        "xrot_control_participation_ratio": participation_ratio(xrot_control_score),
         "top_coupling_generator_parameters": [
             {"flat_index": int(i), "name": flat_names[i], "rms_coefficient": float(coupling_score[i])}
             for i in top_coupling
@@ -606,6 +713,53 @@ def plot_energy_conservation(all_results: list[dict[str, Any]], output_dir: Path
     fig.savefig(output_dir / "energy_conservation.png", dpi=200)
     fig.savefig(output_dir / "energy_conservation.pdf")
     plt.close(fig)
+
+
+def plot_module_attribution_control(
+    all_results: list[dict[str, Any]], parameter_slices: dict[str, slice], output_dir: Path
+) -> None:
+    """Continuous-rotation attribution by module, random init vs. trained -- styled identically
+    to the Mexican-hat's own module_attribution.png for direct comparison. NEGATIVE CONTROL: this
+    system has no continuous rotational symmetry (see rotation_generator_target_NEGATIVE_CONTROL's
+    docstring), so this tests whether the same attribution machinery still shows a "few large,
+    most small" concentration pattern under L1 even when there's no real symmetry to represent."""
+    first, last = all_results[0], all_results[-1]
+    modules = list(parameter_slices.keys())
+
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(modules)), 5), constrained_layout=True)
+    x = np.arange(len(modules))
+    width = 0.38
+    before = [np.linalg.norm(np.asarray(first["xrot_control_score"])[parameter_slices[m]]) for m in modules]
+    after = [np.linalg.norm(np.asarray(last["xrot_control_score"])[parameter_slices[m]]) for m in modules]
+    ax.bar(x - width / 2, before, width, label=f"step {first['step']} (random init)")
+    ax.bar(x + width / 2, after, width, label=f"step {last['step']} (trained)")
+    ax.set_xticks(x)
+    ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right", fontsize=8)
+    ax.set(
+        title=r"$X_{\rm rot}F$ attribution by module (NEGATIVE CONTROL -- no real rotational symmetry)",
+        ylabel=r"$\|c_i\|$ within module",
+    )
+    ax.grid(alpha=0.25, axis="y")
+    ax.legend()
+    fig.savefig(output_dir / "module_attribution_control.png", dpi=200, bbox_inches="tight")
+    fig.savefig(output_dir / "module_attribution_control.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_attribution_scatter_control(
+    all_results: list[dict[str, Any]], parameter_slices: dict[str, slice], output_dir: Path
+) -> None:
+    """Per-parameter continuous-rotation attribution, random init vs. trained -- styled
+    identically to the Mexican-hat's own attribution_scatter.png (log-log, init vs. trained)
+    for direct comparison, rather than against this system's own valid coupling generator."""
+    first, last = all_results[0], all_results[-1]
+    plot_ei_initial_vs_final(
+        np.asarray(first["xrot_control_score"]), np.asarray(last["xrot_control_score"]), parameter_slices,
+        title=r"$X_{\rm rot}F$ attribution (NEGATIVE CONTROL): init vs. trained",
+        output_stem=output_dir / "attribution_scatter_control",
+        quantity_label="$|c_i|$",
+        log_scale=True,
+    )
 
 
 def plot_equivariance_by_module(all_results: list[dict[str, Any]], output_dir: Path) -> None:
@@ -772,6 +926,7 @@ def train_and_analyse(cfg: Config) -> None:
         residuals_fn=residuals_fn,
         integrator=integrator,
         l1_weight=cfg.l1_weight,
+        weight_decay=cfg.weight_decay,
     )
 
     torch.save(model.state_dict(), output_dir / "final_model.pt")
@@ -790,9 +945,16 @@ def train_and_analyse(cfg: Config) -> None:
     plot_energy_conservation(all_results, output_dir)
     plot_equivariance_by_module(all_results, output_dir)
     plot_equivariance_scatter(all_results, parameter_slices, output_dir)
+    plot_module_attribution_control(all_results, parameter_slices, output_dir)
+    plot_attribution_scatter_control(all_results, parameter_slices, output_dir)
     model.load_state_dict(checkpoint_states[cfg.training_steps])
     plot_learned_force_field(model, cfg, device, dtype, output_dir)
     (output_dir / "all_checkpoint_results.json").write_text(json.dumps(all_results, indent=2))
+    print(
+        f"Final X_rot F (negative control -- no real rotational symmetry) attribution PR: "
+        f"{all_results[-1]['xrot_control_participation_ratio']:.2f} "
+        f"(coupling generator PR, unrelated pre-existing diagnostic: {all_results[-1]['coupling_participation_ratio']:.2f})"
+    )
     print(f"Finished. Results written to {output_dir.resolve()}")
 
 

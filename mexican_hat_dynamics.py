@@ -125,98 +125,56 @@ def split_trajectory(trajectory: torch.Tensor, T_window: int, N: int):
     return out, idx
 
 
+def augment_with_random_rotation(tb: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Double a trajectory batch with a random-SO(2)-rotated copy of every sample.
+
+    ``tb`` has layout ``[N, batch, 4]`` = ``[p1, p2, q1, q2]``. Since this
+    system's true dynamics is *exactly* rotationally equivariant for every
+    alpha (verified throughout this project), rotating a valid trajectory by
+    any angle gives another valid trajectory of the same system -- free
+    additional training data that teaches the network rotational consistency
+    implicitly, through data diversity, rather than architecture. One random
+    angle per batch element, shared across the whole time window (the same
+    rotation is a symmetry of the *trajectory*, not just a single point).
+    """
+    batch = tb.shape[1]
+    theta = 2.0 * torch.pi * torch.rand(batch, device=device, dtype=dtype)
+    c, s = torch.cos(theta), torch.sin(theta)
+    rot = torch.stack((torch.stack((c, -s), dim=-1), torch.stack((s, c), dim=-1)), dim=-2)  # [batch, 2, 2]
+
+    tb_aug = tb.clone()
+    p = tb[:, :, :2].permute(1, 0, 2)  # [batch, N, 2]
+    tb_aug[:, :, :2] = torch.bmm(p, rot.transpose(1, 2)).permute(1, 0, 2)
+    q = tb[:, :, 2:].permute(1, 0, 2)
+    tb_aug[:, :, 2:] = torch.bmm(q, rot.transpose(1, 2)).permute(1, 0, 2)
+    return torch.cat((tb, tb_aug), dim=1)
+
+
 def generate_data(
-    alphas: torch.Tensor,
-    Ffun,
-    L: int,
-    T_window: int,
-    N: int,
-    *,
-    dt: float = 0.1,
-    in_conds: int = 8,
-    coarsening_factor: int = 1,
-    device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.float32,
+    alphas: torch.Tensor, Ffun, L: int, T_window: int, N: int, *,
+    dt: float = 0.1, in_conds: int = 8, coarsening_factor: int = 1,
+    device: Optional[torch.device] = None, dtype: torch.dtype = torch.float32,
     augment_dataset: bool = False,
 ):
     if device is None:
         device = alphas.device
-
     K = alphas.shape[0]
     traj_batches_all, sampled_idx_all, params_all = [], [], []
-
     for k in range(K):
         alpha_val = float(alphas[k].item())
-
         ic = generate_initial_conditions(alpha_val, in_conds)
         p0 = ic[:, :2].to(device=device, dtype=dtype)
         q0 = ic[:, 2:].to(device=device, dtype=dtype)
-
-        traj = generate_trajectories(
-            p0, q0, Ffun, alpha_val, L, dt, coarsening_factor
-        )
-
+        traj = generate_trajectories(p0, q0, Ffun, alpha_val, L, dt, coarsening_factor)
         split_traj, sampled_idx = split_trajectory(traj, T_window, N)
-
         splits, Bk = split_traj.shape[0], traj.shape[1]
-
-        tb = (
-            split_traj.permute(1, 0, 2, 3)
-            .contiguous()
-            .view(N, splits * Bk, split_traj.shape[-1])
-        )
-
-        params = torch.full(
-            (splits * Bk, 1),
-            alpha_val,
-            device=device,
-            dtype=dtype,
-        )
+        tb = split_traj.permute(1, 0, 2, 3).contiguous().view(N, splits * Bk, split_traj.shape[-1])
         indices = sampled_idx.repeat_interleave(Bk, dim=0)
-
+        params = torch.full((splits * Bk, 1), alpha_val, device=device, dtype=dtype)
         if augment_dataset:
-            # ------------------------------------------------------------
-            # Random SO(2) rotation of every trajectory.
-            #
-            # State ordering is assumed to be:
-            # [p1, p2, q1, q2]
-            #
-            # Shape of tb:
-            # (N, batch, 4)
-            # ------------------------------------------------------------
-            theta = 2.0 * torch.pi * torch.rand(
-                splits * Bk,
-                device=device,
-                dtype=dtype,
-            )
-
-            c = torch.cos(theta)
-            s = torch.sin(theta)
-
-            R = torch.stack(
-                (
-                    torch.stack((c, -s), dim=-1),
-                    torch.stack((s,  c), dim=-1),
-                ),
-                dim=-2,
-            )  # (batch,2,2)
-
-            tb_aug = tb.clone()
-
-            # Rotate momenta
-            p = tb[:, :, :2].permute(1, 0, 2)               # (batch,N,2)
-            p = torch.bmm(p, R.transpose(1, 2))
-            tb_aug[:, :, :2] = p.permute(1, 0, 2)
-
-            # Rotate positions
-            q = tb[:, :, 2:].permute(1, 0, 2)
-            q = torch.bmm(q, R.transpose(1, 2))
-            tb_aug[:, :, 2:] = q.permute(1, 0, 2)
-
-            tb = torch.cat((tb, tb_aug), dim=1)
-            params = torch.cat((params, params), dim=0)
+            tb = augment_with_random_rotation(tb, device, dtype)
             indices = torch.cat((indices, indices), dim=0)
-
+            params = torch.cat((params, params), dim=0)
         traj_batches_all.append(tb)
         sampled_idx_all.append(indices)
         params_all.append(params)
@@ -227,12 +185,7 @@ def generate_data(
 
     n = trajectories.size(1)
     perm = torch.randperm(n, device=trajectories.device)
-
-    return (
-        trajectories[:, perm, :],
-        params[perm],
-        indices[perm],
-    )
+    return trajectories[:, perm, :], params[perm, :], indices[perm, :]
 
 
 def train_test_split(trajectories, params, indices, val_size: float = 0.25):

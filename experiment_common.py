@@ -19,7 +19,52 @@ import torch
 from tqdm import tqdm
 
 
-def prettify_parameter_name(name: str) -> str:
+def set_paper_style() -> None:
+    """One shared, consistent look for every plot in this project (fonts, spines, grid).
+
+    Called once at import time below, so every script that imports anything
+    from this module picks it up automatically -- edit the values here to
+    change font sizes/colours/etc. everywhere at once. Anything not covered
+    by an rcParam (e.g. the categorical module colour palette) lives in
+    ``module_colours`` just below.
+    """
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.titlesize": 11,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 9,
+        "figure.dpi": 150,
+        "savefig.dpi": 200,
+        "savefig.bbox": "tight",
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.axisbelow": True,
+    })
+
+
+set_paper_style()
+
+
+def _net_layer_index(name: str, prefix: str) -> int | None:
+    """Extract the Sequential layer index from a raw parameter name sharing ``prefix``, or None."""
+    if prefix:
+        if not name.startswith(prefix):
+            return None
+        rest = name[len(prefix):]
+    else:
+        if name.startswith(("V_net.", "K_net.")):
+            return None
+        rest = name
+    rest = rest.replace("inner.mlp.", "net.")
+    match = re.match(r"net\.(\d+)\.(weight|weights|bias)$", rest)
+    return int(match.group(1)) if match else None
+
+
+def prettify_parameter_name(name: str, all_names: list[str] | None = None) -> str:
     """Turn a raw dotted parameter path (e.g. ``'V_net.net.2.weight'``) into a readable label.
 
     Every model in this project follows one of a few shapes: an ASRNN-style
@@ -27,24 +72,45 @@ def prettify_parameter_name(name: str) -> str:
     ``Linear``/activation, so parameters sit at even indices 0, 2, 4, ...),
     a single unified dynamics net for direct_mlp (no V/K prefix), or the
     escnn-wrapped equivariant net (extra ``inner.mlp.`` wrapper layers to
-    strip). This maps any of them to e.g. ``"V (potential): layer 2 weights"``,
-    falling back to the raw name if the pattern isn't recognised.
-    """
-    rest = name
-    if rest.startswith("V_net."):
-        prefix, rest = "V (potential)", rest[len("V_net."):]
-    elif rest.startswith("K_net."):
-        prefix, rest = "K (kinetic)", rest[len("K_net."):]
-    else:
-        prefix = "dynamics net"
+    strip). This maps any of them to e.g. ``"layer 2 weights"``, falling
+    back to the raw name if the pattern isn't recognised.
 
-    rest = rest.replace("inner.mlp.", "net.")
-    match = re.match(r"net\.(\d+)\.(weight|weights|bias)$", rest)
-    if not match:
+    ``MLP.__init__`` always appends one final output ``Linear`` after the
+    hidden stack, so its index is the largest even index present for that
+    net -- pass the full sibling list via ``all_names`` (e.g. the same
+    ``modules`` list the caller is already iterating over) so this can spot
+    that layer and label it ``"output weights"``/``"output biases"`` instead
+    of e.g. ``"layer 4 weights"``, which otherwise reads as a 4th hidden
+    layer on a network configured with only 3. Without ``all_names`` there's
+    no way to know which index is last, so it falls back to plain
+    "layer N" numbering.
+
+    Deliberately drops the V_net/K_net distinction (the caller's context
+    almost always makes it obvious, e.g. a plot that's already restricted to
+    V_net-only parameters) -- if a single plot ever legitimately mixes V_net
+    and K_net modules together, this will produce two identically-labelled
+    legend entries distinguished only by colour; disambiguate at the call
+    site in that case (e.g. by passing distinct labels directly) rather than
+    reintroducing the prefix here.
+    """
+    prefix = ""
+    if name.startswith("V_net."):
+        prefix = "V_net."
+    elif name.startswith("K_net."):
+        prefix = "K_net."
+
+    layer_index = _net_layer_index(name, prefix)
+    if layer_index is None:
         return name
-    layer_number = int(match.group(1)) // 2 + 1
-    kind = "biases" if match.group(2) == "bias" else "weights"
-    return f"{prefix}: layer {layer_number} {kind}"
+    kind = "biases" if name.endswith(".bias") else "weights"
+
+    if all_names is not None:
+        sibling_indices = [i for n in all_names if (i := _net_layer_index(n, prefix)) is not None]
+        if sibling_indices and layer_index == max(sibling_indices):
+            return f"output {kind}"
+
+    layer_number = layer_index // 2 + 1
+    return f"layer {layer_number} {kind}"
 
 
 def module_colours(modules: list[str]) -> dict[str, Any]:
@@ -108,6 +174,7 @@ def run_training_loop(
     residuals_fn: Callable[..., torch.Tensor],
     integrator: torch.nn.Module,
     l1_weight: float = 0.0,
+    weight_decay: float = 0.0,
 ) -> tuple[dict[str, list[float]], dict[int, dict[str, torch.Tensor]]]:
     """Train with Adam or LBFGS, snapshotting the model's state at ``checkpoint_steps``.
 
@@ -126,6 +193,19 @@ def run_training_loop(
     under ``"trajectory_loss"`` so the fit-quality/sparsity tradeoff can be
     read off directly, without the L1 term inflating what "training_loss"
     means relative to an ``l1_weight=0`` run.
+
+    ``weight_decay`` is normally handled by passing it straight to the Adam
+    optimizer (equivalent to adding ``0.5 * weight_decay * sum(theta_i**2)``
+    to the loss -- that's exactly how ``torch.optim.Adam``'s own
+    ``weight_decay`` is implemented, unlike AdamW's decoupled version).
+    ``torch.optim.LBFGS`` has no ``weight_decay`` argument at all, so for
+    that optimizer only, the same L2 penalty is added here directly into the
+    closure's loss instead -- mathematically the same gradient contribution,
+    and it additionally gets folded into the loss value LBFGS's strong-Wolfe
+    line search sees, which is the correct/expected behaviour for a
+    quasi-Newton method. When ``optimizer_name == "adam"`` this path is
+    skipped so the penalty isn't applied twice (once here, once inside
+    Adam's own step).
     """
     checkpoint_steps = set(int(s) for s in checkpoint_steps)
     train_trajectories, train_params, train_instants = train_data
@@ -138,6 +218,10 @@ def run_training_loop(
     def l1_penalty() -> torch.Tensor:
         return sum(p.abs().sum() for p in model.parameters())
 
+    def l2_penalty() -> torch.Tensor:
+        return sum(p.pow(2).sum() for p in model.parameters())
+
+    apply_manual_weight_decay = weight_decay > 0 and optimizer_name.lower() == "lbfgs"
     trajectory_loss_value = [0.0]
 
     progress = tqdm(range(1, training_steps + 1), desc="training", unit="step", dynamic_ncols=True)
@@ -150,7 +234,11 @@ def run_training_loop(
                 train_trajectories, train_params, train_instants, trajectory_window, integrator
             )
             trajectory_loss_value[0] = float(trajectory_loss.detach().cpu())
-            loss = trajectory_loss + l1_weight * l1_penalty() if l1_weight > 0 else trajectory_loss
+            loss = trajectory_loss
+            if l1_weight > 0:
+                loss = loss + l1_weight * l1_penalty()
+            if apply_manual_weight_decay:
+                loss = loss + 0.5 * weight_decay * l2_penalty()
             loss.backward()
             return loss
 
@@ -216,17 +304,13 @@ def plot_training_history(history: dict[str, list[float]], output_dir: Path) -> 
         )
     axes[0].plot(steps, validation, label="validation", linewidth=1.6)
     axes[0].set_yscale("log")
-    axes[0].set(title="ASRNN training history", xlabel="training step", ylabel="trajectory MSE")
+    axes[0].set(xlabel="training step", ylabel="trajectory MSE")
     axes[0].legend()
 
     gap = validation - training
     axes[1].plot(steps, gap, color="tab:purple", linewidth=1.5)
     axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1)
-    axes[1].set(
-        title="Validation minus training loss",
-        xlabel="training step",
-        ylabel="generalisation gap",
-    )
+    axes[1].set(xlabel="training step", ylabel="validation $-$ training loss")
     for ax in axes:
         ax.grid(alpha=0.25)
     fig.savefig(output_dir / "training_diagnostics.png", dpi=200)
@@ -239,7 +323,7 @@ def plot_ei_initial_vs_final(
     ei_final: np.ndarray,
     parameter_slices: dict[str, slice],
     *,
-    title: str,
+    title: str,  # accepted for call-site compatibility but not rendered -- paper figures use a caption instead.
     output_stem: Path,
     quantity_label: str = "$E_i$",
     log_scale: bool = False,
@@ -270,24 +354,21 @@ def plot_ei_initial_vs_final(
         sl = parameter_slices[name]
         ax.scatter(
             ei_initial[sl], ei_final[sl], s=14, color=colours[name],
-            label=prettify_parameter_name(name), alpha=0.75, edgecolors="none",
+            label=prettify_parameter_name(name, modules), alpha=0.75, edgecolors="none",
         )
 
     if log_scale:
         lower = float(min(ei_initial.min(), ei_final.min())) / 1.5
         upper = float(max(ei_initial.max(), ei_final.max())) * 1.5
-        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="$y=x$ (unchanged)")
+        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="$y=x$")
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set(xlim=(lower, upper), ylim=(lower, upper))
     else:
         upper = float(max(ei_initial.max(), ei_final.max(), 1e-6)) * 1.05
-        ax.plot([0, upper], [0, upper], "k--", linewidth=1, label="$y=x$ (unchanged)")
+        ax.plot([0, upper], [0, upper], "k--", linewidth=1, label="$y=x$")
         ax.set(xlim=(0, upper), ylim=(0, upper))
-    ax.set(
-        xlabel=f"{quantity_label} at random init", ylabel=f"{quantity_label} at final checkpoint",
-        title=title,
-    )
+    ax.set(xlabel=f"{quantity_label} at random init", ylabel=f"{quantity_label} at final checkpoint")
     ax.set_aspect("equal")
     ax.grid(alpha=0.25, which="both" if log_scale else "major")
     ax.legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
@@ -304,7 +385,7 @@ def plot_magnitude_vs_quantity(
     parameter_slices: dict[str, slice],
     *,
     quantity_label: str,
-    title: str,
+    title: str,  # accepted for call-site compatibility but not rendered -- paper figures use a caption instead.
     output_stem: Path,
     x_label: str = r"$|\theta_i|$ (parameter magnitude)",
 ) -> None:
@@ -332,12 +413,13 @@ def plot_magnitude_vs_quantity(
             sl = parameter_slices[name]
             ax.scatter(
                 np.maximum(x_values[sl], 1e-12), np.maximum(quantity[sl], 1e-12),
-                s=14, color=colours[name], label=prettify_parameter_name(name),
+                s=14, color=colours[name], label=prettify_parameter_name(name, modules),
                 alpha=0.75, edgecolors="none",
             )
-        #ax.set_xscale("log")
-        #ax.set_yscale("log")
-        ax.set(xlabel=x_label, ylabel=quantity_label, title=f"{title} ({subtitle})")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set(xlabel=x_label, ylabel=quantity_label)
+        ax.set_title(subtitle, fontsize=10)
         ax.grid(alpha=0.25, which="both")
     axes[1].legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
