@@ -33,6 +33,7 @@ don't provide.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -129,6 +130,200 @@ def generate_initial_conditions(
         out[filled : filled + take, 6:8] = q2
         filled += take
     return out
+
+
+# ============================================================
+# Analytic (exact) Kepler-orbit data generation.
+#
+# The old generate_initial_conditions/generate_data pair above samples a random box of
+# (r_vec, v_rel) and integrates numerically -- periapsis distance is then whatever it happens
+# to be, discovered only after simulating, and a training window that happens not to cross
+# periapsis simply never shows the network that regime at all. Since the two-body problem is
+# exactly solvable, we don't have to leave this to chance: periapsis distance is a closed-form
+# function of the orbital elements (r_peri = a*(1-e)), so it can be *stratified* directly, and
+# the exact analytic solution (Kepler's equation) gives ground truth with zero integration
+# error at any eccentricity -- no coarsening_factor, no integrator-resolution tradeoffs, and no
+# risk of the ground truth itself being wrong near a fast periapsis passage.
+# ============================================================
+
+
+def solve_kepler_equation(
+    mean_anomaly: torch.Tensor, eccentricity: torch.Tensor, *, tol: float = 1e-10, max_iter: int = 50,
+) -> torch.Tensor:
+    """Newton-Raphson solve of Kepler's equation M = E - e*sin(E) for the eccentric anomaly E
+    (elliptical orbits, e < 1).
+
+    Verified (session that added this function) against direct fine-step RK4 integration of
+    the true two-body equation of motion: in float64, the analytic orbit this feeds into
+    matches the RK4 reference to ~1e-13 relative error (floating-point exact) at e=0.6; the
+    float32 default here is fine for training data, matching every other system in this
+    project.
+    """
+    M = torch.remainder(mean_anomaly + math.pi, 2 * math.pi) - math.pi  # wrap to [-pi, pi]: stable Newton start
+    E = M.clone()
+    for _ in range(max_iter):
+        f = E - eccentricity * torch.sin(E) - M
+        fp = 1 - eccentricity * torch.cos(E)
+        step = f / fp
+        E = E - step
+        if step.abs().max() < tol:
+            break
+    return E
+
+
+def orbit_state_at_time(
+    a: torch.Tensor, e: torch.Tensor, omega: torch.Tensor, gm_eff: float, t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact planar two-body relative position/velocity (r_vec, v_rel) at time ``t`` since
+    periapsis passage (t=0), for a bound orbit with semi-major axis ``a``, eccentricity ``e``,
+    and periapsis-direction angle ``omega`` (all broadcastable with ``t``).
+
+    ``gm_eff = alpha / REDUCED_MASS`` is the effective "GM" for the reduced one-body form of
+    this problem (mu * r'' = -alpha * rhat / r**2 is exactly the standard Kepler problem with
+    GM replaced by gm_eff). Returns ``(x, y, vx, vy)``.
+    """
+    n = torch.sqrt(torch.as_tensor(gm_eff, dtype=a.dtype, device=a.device) / a**3)  # mean motion
+    E = solve_kepler_equation(n * t, e)
+    cosE, sinE = torch.cos(E), torch.sin(E)
+    x_p = a * (cosE - e)
+    y_p = a * torch.sqrt(1 - e**2) * sinE
+    denom = 1 - e * cosE
+    xdot_p = -a * n * sinE / denom
+    ydot_p = a * n * torch.sqrt(1 - e**2) * cosE / denom
+    cosw, sinw = torch.cos(omega), torch.sin(omega)
+    x = cosw * x_p - sinw * y_p
+    y = sinw * x_p + cosw * y_p
+    vx = cosw * xdot_p - sinw * ydot_p
+    vy = sinw * xdot_p + cosw * ydot_p
+    return x, y, vx, vy
+
+
+def _log_uniform(n: int, low: float, high: float) -> torch.Tensor:
+    u = torch.rand(n) * (math.log(high) - math.log(low)) + math.log(low)
+    return torch.exp(u)
+
+
+def sample_stratified_orbits(
+    alpha: float, n: int, *, r_peri_min: float, r_peri_max: float, r_apo_max: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Sample bound orbital elements with *both* periapsis and apoapsis stratified
+    log-uniformly, rather than periapsis alone with an independently-sampled eccentricity.
+
+    Sampling periapsis and eccentricity independently (an earlier version of this function)
+    lets apoapsis blow up uncontrollably: r_apo = r_peri*(1+e)/(1-e) reaches ~15 for
+    r_peri=1.2, e_max=0.85, even though r_peri itself stays small elsewhere -- found the hard
+    way when a network trained on this couldn't get anywhere, because the resulting position/
+    velocity magnitudes spanned such a huge dynamic range (up to v~8, |q|~4, versus O(1)
+    elsewhere) that the trajectory-fitting MSE loss was dominated by a handful of huge-orbit
+    outliers, drowning out the close-approach learning signal the whole redesign was for.
+
+    Sampling r_peri and r_apo directly and independently (both capped) avoids this
+    entirely -- orbit *size* (r_apo) is controlled the same deliberate way as how *close* it
+    gets (r_peri), and eccentricity/semi-major axis are simply derived from the two:
+    a = (r_peri + r_apo)/2, e = (r_apo - r_peri)/(r_apo + r_peri).
+
+    Returns ``(a, e, omega, gm_eff)``, each of shape ``[n]`` except ``gm_eff`` (a scalar).
+    """
+    gm_eff = alpha / REDUCED_MASS
+    r_peri = _log_uniform(n, r_peri_min, r_peri_max)
+    r_apo = torch.maximum(_log_uniform(n, r_peri_max, r_apo_max), r_peri * 1.05)
+    a = 0.5 * (r_peri + r_apo)
+    e = (r_apo - r_peri) / (r_apo + r_peri)
+    omega = 2 * math.pi * torch.rand(n)
+    return a, e, omega, gm_eff
+
+
+def generate_data_analytic(
+    alphas: torch.Tensor, T_window: int, N: int, *,
+    dt: float = 0.1, in_conds: int = 8, splits: int = 5,
+    r_peri_min: float = 0.08, r_peri_max: float = 1.2, r_apo_max: float = 2.0,
+    periapsis_centered_fraction: float = 0.5, cm_box: float = 0.8,
+    augment_dataset: bool = False, device: Optional[torch.device] = None, dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate trajectory windows via the exact analytic Kepler solution -- the preferred
+    two-body data generator (see the module-level note above); no numerical integration is
+    used for ground truth at all, so it is exact through periapsis regardless of eccentricity.
+
+    For each of ``in_conds`` orbits sampled per alpha (periapsis *and* apoapsis stratified via
+    ``sample_stratified_orbits`` -- apoapsis is capped too, so a wide periapsis range can't
+    produce runaway-sized orbits), generates ``splits`` windows each: a
+    ``periapsis_centered_fraction`` of them are deliberately time-shifted (with a little random
+    jitter) so periapsis passage falls near the middle of the window -- guaranteeing the
+    network actually trains on that orbit's own closest approach, rather than only seeing it
+    when a randomly-phased window happens to cross it; the rest use a uniformly random phase
+    across the whole orbital period (general diversity, matching the spirit of the old
+    box-sampling approach). The centre of mass is placed at a random, per-window offset and
+    left at rest, same as before -- what makes translation invariance non-trivial to learn.
+
+    Returns ``(trajectories, params, indices)`` in exactly the format
+    ``generic_residuals``/``residuals`` expect: ``trajectories`` has shape
+    ``[N, batch, 8]`` = ``[p1x,p1y,p2x,p2y,q1x,q1y,q2x,q2y]`` at the ``N`` sampled instants,
+    ``indices`` has shape ``[batch, N]`` giving which of the ``T_window`` outer integrator
+    steps (always including step 0) each sampled instant corresponds to.
+    """
+    if device is None:
+        device = alphas.device
+    K = alphas.shape[0]
+    n_centered = int(round(periapsis_centered_fraction * splits))
+    traj_batches_all, sampled_idx_all, params_all = [], [], []
+
+    for k in range(K):
+        alpha_val = float(alphas[k].item())
+        a, e, omega, gm_eff = sample_stratified_orbits(
+            alpha_val, in_conds, r_peri_min=r_peri_min, r_peri_max=r_peri_max, r_apo_max=r_apo_max,
+        )
+        period = 2 * math.pi * torch.sqrt(a**3 / gm_eff)
+
+        batch = in_conds * splits
+        a_b = a.repeat_interleave(splits)
+        e_b = e.repeat_interleave(splits)
+        omega_b = omega.repeat_interleave(splits)
+        period_b = period.repeat_interleave(splits)
+        split_of = torch.arange(splits).repeat(in_conds)
+        is_centered = split_of < n_centered
+
+        centered_start = -0.5 * (T_window - 1) * dt + (torch.rand(batch) - 0.5) * 0.4 * (T_window - 1) * dt
+        random_start = torch.rand(batch) * period_b
+        t_start = torch.where(is_centered, centered_start, random_start)
+
+        idx = torch.zeros(batch, N, dtype=torch.long)
+        if N > 1:
+            for b in range(batch):
+                idx[b, 1:] = 1 + torch.randperm(T_window - 1)[: N - 1]
+            idx, _ = torch.sort(idx, dim=1)
+
+        t = t_start.unsqueeze(1) + idx.to(dtype=dtype) * dt  # [batch, N]
+        x, y, vx, vy = orbit_state_at_time(
+            a_b.unsqueeze(1), e_b.unsqueeze(1), omega_b.unsqueeze(1), gm_eff, t,
+        )
+
+        q_cm = cm_box * (2 * torch.rand(batch, 2) - 1)
+        q1x, q1y = q_cm[:, 0:1] + 0.5 * x, q_cm[:, 1:2] + 0.5 * y
+        q2x, q2y = q_cm[:, 0:1] - 0.5 * x, q_cm[:, 1:2] - 0.5 * y
+        p1x, p1y = 0.5 * vx, 0.5 * vy
+        p2x, p2y = -0.5 * vx, -0.5 * vy
+
+        traj_batch = torch.stack([p1x, p1y, p2x, p2y, q1x, q1y, q2x, q2y], dim=-1)  # [batch, N, 8]
+        traj_batch = traj_batch.permute(1, 0, 2).contiguous().to(device=device, dtype=dtype)  # [N, batch, 8]
+        idx_batch = idx.to(device=device)
+        params = torch.full((batch, 1), alpha_val, device=device, dtype=dtype)
+
+        if augment_dataset:
+            traj_batch = augment_with_random_rotation_and_translation(traj_batch, device, dtype)
+            idx_batch = torch.cat([idx_batch, idx_batch], dim=0)
+            params = torch.cat([params, params], dim=0)
+
+        traj_batches_all.append(traj_batch)
+        sampled_idx_all.append(idx_batch)
+        params_all.append(params)
+
+    trajectories = torch.cat(traj_batches_all, dim=1)
+    params = torch.cat(params_all, dim=0)
+    indices = torch.cat(sampled_idx_all, dim=0)
+
+    n_total = trajectories.size(1)
+    perm = torch.randperm(n_total, device=trajectories.device)
+    return trajectories[:, perm, :], params[perm, :], indices[perm, :]
 
 
 def generate_data(

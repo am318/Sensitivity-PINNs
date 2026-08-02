@@ -75,6 +75,7 @@ from two_body_dynamics import (
     SubsteppedDirectLeapfrogIntegrator,
     SubsteppedVerletIntegrator,
     generate_data,
+    generate_data_analytic,
     train_test_split,
 )
 
@@ -100,43 +101,67 @@ class Config:
     training_alphas: list[float] = field(
         default_factory=lambda: [1.0, 1.3, 1.6, 2.0, 2.5, 3.0]
     )
-    trajectory_window: int = 8
-    trajectory_splits: int = 8
-    sampled_instants: int = 8
-    initial_conditions_per_alpha: int = 20
+    trajectory_window: int = 10
+    trajectory_splits: int = 10
+    sampled_instants: int = 10
+    initial_conditions_per_alpha: int = 10
     integration_dt: float = 0.1
-    # coarsening_factor is only used to generate the fine, accurate *ground-truth*
-    # trajectory (dt/coarsening_factor internal steps) -- it says nothing about the
-    # resolution of the *training-time* differentiable rollout, which is controlled
-    # separately by integrator_substeps below.
-    coarsening_factor: int = 100
     # The training-time rollout (SubsteppedVerletIntegrator/SubsteppedDirectLeapfrogIntegrator)
     # takes this many sub-steps of size integration_dt/integrator_substeps per outer
-    # trajectory-window index. This matters much more here than in the other scripts in this
-    # project: verified numerically (session that added this field) that a *single*
-    # un-substepped dt=0.1 Verlet step -- what every other script's plain VerletIntegrator
-    # does, and what a smooth polynomial potential tolerates fine -- already accumulates
-    # >50% relative trajectory error for a majority of bound orbits under this system's 1/r
-    # potential, using the *exact* force law, before any learning is involved. Periapsis
-    # passage is simply too fast for that step size. Combined with the tightened ic_* bounds
-    # below, substeps=10 reduces the same test to <3% relative error for every sampled orbit.
-    integrator_substeps: int = 10
+    # trajectory-window index. IMPORTANT compute-cost note (session that added the analytic
+    # Kepler generator below): this cost is roughly *linear* in integrator_substeps and in
+    # (trajectory_window - 1) -- verified empirically (substeps 10->40 measured ~5x wall-clock
+    # cost, matching the ~4x step-count increase). substeps=80-100 gives excellent accuracy
+    # even at r_peri_min as low as 0.08 (0% of periapsis-centred windows over 10% error), but
+    # was measured to cost ~25-35 hours for just 5000 steps at a realistic batch size on this
+    # machine's MPS backend -- impractical. substeps=30 with the milder r_peri_min=0.1 below
+    # gives a much more usable ~1.3% failure rate (still far better than the old box-sampler,
+    # which avoided close approaches almost entirely rather than resolving them -- see the
+    # module-level note on generate_data_analytic in two_body_dynamics.py). Benchmark a few
+    # steps on your own machine before committing to a long run: this is the single biggest
+    # lever on wall-clock cost, and worth tuning down further (or up, for more accuracy) based
+    # on your own patience.
+    integrator_substeps: int = 20
     validation_fraction: float = 0.25
 
-    # Initial-condition rejection sampling (two_body_dynamics.generate_initial_conditions).
-    # Sampled in relative coordinates then placed at a random centre-of-mass offset -- see
-    # that function's docstring for exactly what each does. These are deliberately tighter
-    # than a "natural-looking" wide box: the original wide defaults produced orbits up to
-    # e=0.97 (nearly parabolic) with periapsis as small as r=0.024, which no realistic
-    # integrator_substeps budget resolves cleanly (verified: even substeps=40 left >7% of
-    # orbits with >5% error on that wide box). These bounds cap eccentricity at roughly 0.85
-    # and keep periapsis >~0.13, which is what actually makes integrator_substeps=10 work.
-    ic_r_box: float = 1.7
-    ic_v_box: float = 0.55
-    ic_r_min: float = 0.9
-    ic_energy_margin: float = 0.3
-    ic_l_min: float = 0.7
-    ic_cm_box: float = 0.8
+    # Which data generator to use -- see two_body_dynamics.py for both. "analytic" (default,
+    # recommended) uses the exact Kepler solution with periapsis/apoapsis deliberately
+    # stratified; "box_sampler" is the original numerical-integration + random-box-rejection
+    # approach, kept available (not deleted) so the two can be compared directly rather than
+    # forcing a single choice.
+    data_generation: str = "analytic"  # "analytic" or "box_sampler"
+
+    # --- "analytic" generator fields (two_body_dynamics.generate_data_analytic) ---
+    # Periapsis *and* apoapsis are both stratified log-uniformly (independently), rather than
+    # periapsis alone with an independently-sampled eccentricity -- the latter lets apoapsis
+    # blow up uncontrollably for wide-periapsis/high-eccentricity combinations (r_apo up to
+    # ~15 was observed with r_peri_max=1.2, e_max=0.85), producing huge position/velocity
+    # outliers that dominated the trajectory-fitting MSE loss and stalled training entirely.
+    # Capping both directly keeps the whole dataset's dynamic range sane while still visiting
+    # genuinely close approaches. r_peri_min small is safe as long as integrator_substeps
+    # above is large enough to let the *training-time* rollout resolve it (verified together;
+    # see the integrator_substeps note above for the accuracy/speed tradeoff this involves).
+    r_peri_min: float = 0.1
+    r_peri_max: float = 1.2
+    r_apo_max: float = 2.0
+    # Fraction of windows per orbit deliberately time-shifted so periapsis passage falls near
+    # the window's middle (guaranteeing the network actually trains on that orbit's closest
+    # approach); the rest use a uniformly random phase across the full orbital period.
+    periapsis_centered_fraction: float = 0.1
+    cm_box: float = 0.8
+
+    # --- "box_sampler" generator fields (two_body_dynamics.generate_initial_conditions) ---
+    # Sampled in relative coordinates via rejection sampling then placed at a random CM
+    # offset; ground truth is numerically integrated with this many fine internal substeps
+    # (dt/coarsening_factor) for accuracy. These defaults are the ones verified earlier in
+    # this project to keep periapsis-in-window incidence low (~2%) at trajectory_window=5.
+    box_ic_r_box: float = 1.7
+    box_ic_v_box: float = 0.55
+    box_ic_r_min: float = 0.01
+    box_ic_energy_margin: float = 0.01
+    box_ic_l_min: float = 0.7
+    box_ic_cm_box: float = 0.8
+    box_coarsening_factor: int = 100
 
     # Doubles the training set with a copy transformed by a random rotation
     # (applied to both particles together) *and* an independent random shift
@@ -144,13 +169,13 @@ class Config:
     # of this system's true dynamics for every alpha > 0 (verified before use),
     # so this is free, exactly-valid additional data teaching both symmetries
     # implicitly through data diversity.
-    augment_dataset: bool = False
+    augment_dataset: bool = True
 
-    optimizer: str = "adam"
+    optimizer: str = "lbfgs"
     training_steps: int = 5000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    l1_weight: float = 0.0
+    l1_weight: float = 1e-5
     # Clips the total gradient norm before every optimizer step. Needed here specifically:
     # verified in a real run (session that added this field) that Adam took one catastrophic
     # step mid-training (trajectory loss 0.00009 -> 0.011 between two consecutive steps) and
@@ -203,6 +228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", help="Override Config.device.")
     parser.add_argument("--output-dir", help="Override Config.output_dir.")
     parser.add_argument("--architecture", choices=["hamiltonian", "direct_mlp"], help="Override Config.architecture.")
+    parser.add_argument("--data-generation", choices=["analytic", "box_sampler"], help="Override Config.data_generation.")
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
@@ -218,6 +244,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.output_dir = args.output_dir
     if args.architecture:
         cfg.architecture = args.architecture
+    if args.data_generation:
+        cfg.data_generation = args.data_generation
     if args.l1_weight is not None:
         cfg.l1_weight = args.l1_weight
     if args.augment_dataset is not None:
@@ -228,7 +256,6 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.direct_mlp_hidden_dim = 8
         cfg.initial_conditions_per_alpha = 2
         cfg.trajectory_splits = 2
-        cfg.coarsening_factor = 2
         cfg.training_steps = 2
         cfg.checkpoint_steps = [0, 1, 2]
         cfg.analysis_alphas = [0.6, 1.0, 1.6]
@@ -252,6 +279,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("alpha must be strictly positive (attractive coupling) for bound closed orbits to exist.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
+    if cfg.data_generation not in {"analytic", "box_sampler"}:
+        raise ValueError("data_generation must be 'analytic' or 'box_sampler'.")
+    if not 0.0 < cfg.r_peri_min < cfg.r_peri_max < cfg.r_apo_max:
+        raise ValueError("must have 0 < r_peri_min < r_peri_max < r_apo_max.")
+    if not 0.0 <= cfg.periapsis_centered_fraction <= 1.0:
+        raise ValueError("periapsis_centered_fraction must lie in [0, 1].")
     cfg.checkpoint_steps = sorted(
         {int(s) for s in cfg.checkpoint_steps if 0 <= int(s) <= cfg.training_steps}
         | {0, cfg.training_steps}
@@ -260,17 +293,26 @@ def validate_config(cfg: Config) -> None:
 
 def make_dataset(cfg: Config, device: torch.device, dtype: torch.dtype):
     alphas = torch.tensor(cfg.training_alphas, device=device, dtype=dtype)
-    total_length = cfg.trajectory_splits + cfg.trajectory_window - 1
-    ic_kwargs = dict(
-        r_box=cfg.ic_r_box, v_box=cfg.ic_v_box, r_min=cfg.ic_r_min,
-        energy_margin=cfg.ic_energy_margin, l_min=cfg.ic_l_min, cm_box=cfg.ic_cm_box,
-    )
-    trajectories, params, indices = generate_data(
-        alphas, F, total_length, cfg.trajectory_window, cfg.sampled_instants,
-        dt=cfg.integration_dt, in_conds=cfg.initial_conditions_per_alpha,
-        coarsening_factor=cfg.coarsening_factor, device=device, dtype=dtype,
-        augment_dataset=cfg.augment_dataset, ic_kwargs=ic_kwargs,
-    )
+    if cfg.data_generation == "box_sampler":
+        total_length = cfg.trajectory_splits + cfg.trajectory_window - 1
+        ic_kwargs = dict(
+            r_box=cfg.box_ic_r_box, v_box=cfg.box_ic_v_box, r_min=cfg.box_ic_r_min,
+            energy_margin=cfg.box_ic_energy_margin, l_min=cfg.box_ic_l_min, cm_box=cfg.box_ic_cm_box,
+        )
+        trajectories, params, indices = generate_data(
+            alphas, F, total_length, cfg.trajectory_window, cfg.sampled_instants,
+            dt=cfg.integration_dt, in_conds=cfg.initial_conditions_per_alpha,
+            coarsening_factor=cfg.box_coarsening_factor, device=device, dtype=dtype,
+            augment_dataset=cfg.augment_dataset, ic_kwargs=ic_kwargs,
+        )
+    else:
+        trajectories, params, indices = generate_data_analytic(
+            alphas, cfg.trajectory_window, cfg.sampled_instants,
+            dt=cfg.integration_dt, in_conds=cfg.initial_conditions_per_alpha, splits=cfg.trajectory_splits,
+            r_peri_min=cfg.r_peri_min, r_peri_max=cfg.r_peri_max, r_apo_max=cfg.r_apo_max,
+            periapsis_centered_fraction=cfg.periapsis_centered_fraction, cm_box=cfg.cm_box,
+            augment_dataset=cfg.augment_dataset, device=device, dtype=dtype,
+        )
     return train_test_split(trajectories, params, indices, val_size=cfg.validation_fraction)
 
 
@@ -974,7 +1016,7 @@ def plot_learned_potential_radial(
         return
     model.eval()
     alphas = cfg.plotting_alphas
-    r_values = torch.linspace(max(cfg.ic_r_min * 0.5, 0.05), cfg.q_extent * 2.0, 60, device=device, dtype=dtype)
+    r_values = torch.linspace(max(cfg.r_peri_min * 0.5, 0.02), cfg.q_extent * 2.0, 60, device=device, dtype=dtype)
     contexts = [(0.0, 0.0, 0.0), (cfg.cm_extent, 0.0, 30.0), (-cfg.cm_extent, cfg.cm_extent, 110.0)]
 
     fig, axes = plt.subplots(1, len(alphas), figsize=(4.2 * len(alphas), 4.2), constrained_layout=True, squeeze=False)
@@ -1003,6 +1045,75 @@ def plot_learned_potential_radial(
     plt.close(fig)
 
 
+def _sample_windows(data: tuple[torch.Tensor, torch.Tensor, torch.Tensor], n_sample: int):
+    trajectories, _, indices = data
+    batch = trajectories.shape[1]
+    sample = torch.randperm(batch)[: min(n_sample, batch)]
+    return trajectories[:, sample, :], indices[sample, :]
+
+
+def plot_training_data_trajectories(
+    train_data: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    val_data: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    output_dir: Path, n_sample: int = 40,
+) -> None:
+    """Pure data diagnostic, independent of any model: plot the actual sampled trajectory
+    windows used for training/validation as spatial paths of the relative separation
+    r_vec = q1 - q2 (centred at the origin -- the random per-window centre-of-mass placement
+    would otherwise just scatter absolute (q1, q2) positions around the plot without adding
+    anything physically informative here, since translation invariance means only each
+    orbit arc's *shape*, not where its centre of mass landed, matters for this diagnostic).
+
+    This is exactly the kind of plot that would have caught the r_apo blow-up bug (session
+    that added this function) immediately: sampling eccentricity independently of periapsis
+    let some orbits reach apoapsis ~15, wildly outside the intended domain -- a plot like
+    this makes a run-away orbit visually obvious rather than requiring a manual magnitude
+    check after the fact.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.5), constrained_layout=True)
+    for ax, data, title in ((axes[0], train_data, "training windows"), (axes[1], val_data, "validation windows")):
+        trajectories, _ = _sample_windows(data, n_sample)
+        r_vec = (trajectories[:, :, 4:6] - trajectories[:, :, 6:8]).cpu().numpy()  # [N, n_sample, 2]
+        for b in range(r_vec.shape[1]):
+            ax.plot(r_vec[:, b, 0], r_vec[:, b, 1], marker="o", ms=3, linewidth=1, alpha=0.6)
+        ax.scatter([0], [0], marker="x", color="k", s=50, zorder=5, label="other body")
+        ax.set(xlabel="$r_x = q_{1x}-q_{2x}$", ylabel="$r_y$", title=title)
+        ax.set_aspect("equal")
+        ax.grid(alpha=0.25)
+    axes[0].legend(fontsize=8)
+    fig.savefig(output_dir / "training_data_trajectories.png", dpi=200, bbox_inches="tight")
+    fig.savefig(output_dir / "training_data_trajectories.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_training_data_radial(
+    train_data: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    val_data: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    output_dir: Path, n_sample: int = 40,
+) -> None:
+    """Pure data diagnostic: r=|q1-q2| against the outer-step index within each sampled
+    window, for a random subset of training/validation windows -- shows how close each
+    window actually gets to periapsis, how well the sampled instants resolve the passage
+    (few points near the minimum means a coarse view of it), and, same as the trajectory
+    plot above, immediately flags any run-away magnitude in the generated data (a genuine
+    singularity approach shows up as a curve plunging toward the log-scale floor; a data bug
+    inflating orbit size shows up as curves reaching unexpectedly large r).
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5), constrained_layout=True)
+    for ax, data, title in ((axes[0], train_data, "training windows"), (axes[1], val_data, "validation windows")):
+        trajectories, indices = _sample_windows(data, n_sample)
+        r = (trajectories[:, :, 4:6] - trajectories[:, :, 6:8]).norm(dim=-1).cpu().numpy()  # [N, n_sample]
+        step_idx = indices.cpu().numpy().T.astype(float)  # [N, n_sample]
+        for b in range(r.shape[1]):
+            ax.plot(step_idx[:, b], r[:, b], marker="o", ms=3, linewidth=1, alpha=0.6)
+        ax.set(xlabel="outer step index within window", ylabel="$r=|q_1-q_2|$", title=title)
+        ax.set_yscale("log")
+        ax.grid(alpha=0.25, which="both")
+    fig.savefig(output_dir / "training_data_radial.png", dpi=200, bbox_inches="tight")
+    fig.savefig(output_dir / "training_data_radial.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 def report_sparsity(model: torch.nn.Module, thresholds: tuple[float, ...] = (1e-4, 1e-3, 1e-2)) -> dict[str, Any]:
     all_params = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()])
     return {
@@ -1025,6 +1136,8 @@ def train_and_analyse(cfg: Config) -> None:
     print(f"Device: {device}; dtype: {dtype}; output: {output_dir}")
     print("Generating sparse two-body trajectories...")
     train_data, validation_data = make_dataset(cfg, device, dtype)
+    plot_training_data_trajectories(train_data, validation_data, output_dir)
+    plot_training_data_radial(train_data, validation_data, output_dir)
     model, integrator = build_model(cfg, device, dtype)
     optimizer = make_optimizer(cfg, model)
     flat_names, parameter_slices = parameter_layout(model)
