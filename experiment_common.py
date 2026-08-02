@@ -9,6 +9,7 @@ import copy
 import csv
 import json
 import re
+import signal
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Callable
@@ -175,8 +176,20 @@ def run_training_loop(
     integrator: torch.nn.Module,
     l1_weight: float = 0.0,
     weight_decay: float = 0.0,
+    max_grad_norm: float | None = None,
 ) -> tuple[dict[str, list[float]], dict[int, dict[str, torch.Tensor]]]:
     """Train with Adam or LBFGS, snapshotting the model's state at ``checkpoint_steps``.
+
+    ``max_grad_norm``, if given, clips the total gradient norm (``torch.nn.utils.
+    clip_grad_norm_``) right before every optimizer step. Off by default (``None``) to
+    keep this a no-op for every script that doesn't ask for it. Added after a real
+    instability found in the two-body script: Adam took one catastrophic step mid-training
+    (trajectory loss 0.00009 -> 0.011 between two consecutive steps) and never fully
+    recovered within the remaining budget -- occasional very large gradients are expected
+    for a system whose true force genuinely blows up near collision (1/r**3), which a
+    smooth, unconstrained MLP has no structural reason to avoid replicating locally during
+    training. Clipping bounds the damage from any single such step without changing the
+    overall optimization trajectory when gradients are already well-behaved.
 
     Both the double-well and Hénon-Heiles ASRNN helper modules expose the same
     ``(trajectories, params, instants)`` data layout and the same
@@ -206,6 +219,14 @@ def run_training_loop(
     quasi-Newton method. When ``optimizer_name == "adam"`` this path is
     skipped so the penalty isn't applied twice (once here, once inside
     Adam's own step).
+
+    A single Ctrl-C (SIGINT) during training does *not* abort the process: it finishes the
+    current step, force-saves a checkpoint at that step (even if it wasn't one of the
+    originally requested ``checkpoint_steps``), and returns normally so the caller proceeds
+    straight to checkpoint analysis/plotting on whatever was trained so far -- useful for a
+    long run whose loss has visibly plateaued, without losing the ability to inspect it. A
+    second Ctrl-C while the first is still pending aborts immediately (restores Python's
+    default SIGINT behaviour and re-raises), for when you really do just want to kill it.
     """
     checkpoint_steps = set(int(s) for s in checkpoint_steps)
     train_trajectories, train_params, train_instants = train_data
@@ -225,47 +246,76 @@ def run_training_loop(
     trajectory_loss_value = [0.0]
 
     progress = tqdm(range(1, training_steps + 1), desc="training", unit="step", dynamic_ncols=True)
-    for step in progress:
-        model.train()
 
-        def closure():
-            optimizer.zero_grad()
-            trajectory_loss = residuals_fn(
-                train_trajectories, train_params, train_instants, trajectory_window, integrator
-            )
-            trajectory_loss_value[0] = float(trajectory_loss.detach().cpu())
-            loss = trajectory_loss
-            if l1_weight > 0:
-                loss = loss + l1_weight * l1_penalty()
-            if apply_manual_weight_decay:
-                loss = loss + 0.5 * weight_decay * l2_penalty()
-            loss.backward()
-            return loss
+    interrupt_count = [0]
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
 
-        if optimizer_name.lower() == "lbfgs":
-            training_loss = float(optimizer.step(closure).detach().cpu())
-        else:
-            loss = closure()
-            optimizer.step()
-            training_loss = float(loss.detach().cpu())
-
-        model.eval()
-        validation_loss = float(
-            residuals_fn(
-                val_trajectories, val_params, val_instants, trajectory_window, integrator
-            ).detach().cpu()
-        )
-        history["step"].append(step)
-        history["training_loss"].append(training_loss)
-        history["trajectory_loss"].append(trajectory_loss_value[0])
-        history["validation_loss"].append(validation_loss)
-        progress.set_postfix(train=f"{trajectory_loss_value[0]:.3e}", val=f"{validation_loss:.3e}")
-        if step in checkpoint_steps:
-            checkpoint_states[step] = copy.deepcopy(model.state_dict())
+    def handle_sigint(signum, frame):
+        interrupt_count[0] += 1
+        if interrupt_count[0] == 1:
             progress.write(
-                f"step {step:5d} | trajectory {trajectory_loss_value[0]:.5e} | "
-                f"validation {validation_loss:.5e}"
+                "\nKeyboardInterrupt: finishing the current step, then stopping training "
+                "early to run checkpoint analysis/plotting on what's been trained so far. "
+                "Press Ctrl-C again to abort immediately instead."
             )
+        else:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+            raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    try:
+        for step in progress:
+            model.train()
+
+            def closure():
+                optimizer.zero_grad()
+                trajectory_loss = residuals_fn(
+                    train_trajectories, train_params, train_instants, trajectory_window, integrator
+                )
+                trajectory_loss_value[0] = float(trajectory_loss.detach().cpu())
+                loss = trajectory_loss
+                if l1_weight > 0:
+                    loss = loss + l1_weight * l1_penalty()
+                if apply_manual_weight_decay:
+                    loss = loss + 0.5 * weight_decay * l2_penalty()
+                loss.backward()
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                return loss
+
+            if optimizer_name.lower() == "lbfgs":
+                training_loss = float(optimizer.step(closure).detach().cpu())
+            else:
+                loss = closure()
+                optimizer.step()
+                training_loss = float(loss.detach().cpu())
+
+            model.eval()
+            validation_loss = float(
+                residuals_fn(
+                    val_trajectories, val_params, val_instants, trajectory_window, integrator
+                ).detach().cpu()
+            )
+            history["step"].append(step)
+            history["training_loss"].append(training_loss)
+            history["trajectory_loss"].append(trajectory_loss_value[0])
+            history["validation_loss"].append(validation_loss)
+            progress.set_postfix(train=f"{trajectory_loss_value[0]:.3e}", val=f"{validation_loss:.3e}")
+            if step in checkpoint_steps:
+                checkpoint_states[step] = copy.deepcopy(model.state_dict())
+                progress.write(
+                    f"step {step:5d} | trajectory {trajectory_loss_value[0]:.5e} | "
+                    f"validation {validation_loss:.5e}"
+                )
+
+            if interrupt_count[0] > 0:
+                if step not in checkpoint_states:
+                    checkpoint_states[step] = copy.deepcopy(model.state_dict())
+                progress.write(f"Stopped early at step {step} (of {training_steps} requested).")
+                break
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
     return history, checkpoint_states
 

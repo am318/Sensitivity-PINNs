@@ -98,10 +98,10 @@ class Config:
     training_alphas: list[float] = field(
         default_factory=lambda: [-1.1, -0.8, -0.6, -0.2, 0.2, 0.6, 0.8, 1.1]
     )
-    trajectory_window: int = 100
-    trajectory_splits: int = 50
-    sampled_instants: int = 5
-    initial_conditions_per_alpha: int = 8
+    trajectory_window: int = 20
+    trajectory_splits: int = 100
+    sampled_instants: int = 10
+    initial_conditions_per_alpha: int = 10
     integration_dt: float = 0.1
     coarsening_factor: int = 100
     validation_fraction: float = 0.25
@@ -113,7 +113,7 @@ class Config:
     augment_dataset: bool = False
 
     optimizer: str = "adam"  # adam or lbfgs
-    training_steps: int = 100000
+    training_steps: int = 50000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     # L1 penalty on all parameters, added to the trajectory-fitting loss --
@@ -528,7 +528,6 @@ def analyse_checkpoint(
     energy_attribution_score = np.sqrt(np.mean(energy_attribution_matrix**2, axis=0))
 
     vnet_mask = np.array([name.startswith("V_net.") for name in flat_names])
-
     xrot_mag_corr = parameter_magnitude_ci_correlation(
         parameter_magnitude,
         xrot_score,
@@ -1095,7 +1094,7 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
-    for step in tqdm(cfg.checkpoint_steps, desc="checkpoint analysis", unit="checkpoint"):
+    for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
         result = analyse_checkpoint(model, step, cfg, device, dtype, flat_names, parameter_slices)
         write_checkpoint_outputs(result, output_dir)
@@ -1111,12 +1110,11 @@ def train_and_analyse(cfg: Config) -> None:
     plot_symmetry_attribution_scatter(all_results, parameter_slices, output_dir)
     (output_dir / "all_checkpoint_results.json").write_text(json.dumps(all_results, indent=2))
 
-    model.load_state_dict(checkpoint_states[cfg.training_steps])
+    model.load_state_dict(checkpoint_states[max(checkpoint_states.keys())])
     plot_learned_force_field(model, cfg, device, dtype, output_dir)
     plot_learned_potential(model, cfg, device, dtype, output_dir)
     sparsity = report_sparsity(model)
     (output_dir / "sparsity_report.json").write_text(json.dumps(sparsity, indent=2))
-
     # Training Quality Report
     summary = {
     "xrot_magnitude_correlation": all_results[-1]["xrot_magnitude_correlation"],
@@ -1127,7 +1125,6 @@ def train_and_analyse(cfg: Config) -> None:
     (output_dir / "xrot_sparsity_summary.json").write_text(
         json.dumps(summary, indent=2)
     )
-
     print(f"Sparsity (final checkpoint): {sparsity['fraction_below_threshold']}")
     print(
         f"Final rotation attribution PR: {all_results[-1]['xrot_participation_ratio']:.2f}; "

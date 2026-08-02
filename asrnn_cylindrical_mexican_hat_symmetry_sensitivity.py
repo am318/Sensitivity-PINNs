@@ -721,7 +721,7 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
-    for step in tqdm(cfg.checkpoint_steps, desc="checkpoint analysis", unit="checkpoint"):
+    for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
         result = analyse_checkpoint(model, step, cfg, device, dtype, flat_names, parameter_slices)
         write_checkpoint_outputs(result, output_dir)
@@ -735,7 +735,7 @@ def train_and_analyse(cfg: Config) -> None:
     plot_symmetry_attribution_scatter(all_results, parameter_slices, output_dir)
     (output_dir / "all_checkpoint_results.json").write_text(json.dumps(all_results, indent=2))
 
-    model.load_state_dict(checkpoint_states[cfg.training_steps])
+    model.load_state_dict(checkpoint_states[max(checkpoint_states.keys())])
     sparsity = report_sparsity(model)
     (output_dir / "sparsity_report.json").write_text(json.dumps(sparsity, indent=2))
     print(f"Sparsity (final checkpoint): {sparsity['fraction_below_threshold']}")

@@ -919,7 +919,7 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
-    for step in tqdm(cfg.checkpoint_steps, desc="checkpoint analysis", unit="checkpoint"):
+    for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
         result = analyse_checkpoint(
             model,
@@ -938,7 +938,7 @@ def train_and_analyse(cfg: Config) -> None:
     plot_energy_conservation(all_results, output_dir)
     plot_equivariance_by_module(all_results, output_dir)
     plot_equivariance_scatter(all_results, parameter_slices, output_dir)
-    model.load_state_dict(checkpoint_states[cfg.training_steps])
+    model.load_state_dict(checkpoint_states[max(checkpoint_states.keys())])
     plot_learned_physics(model, cfg, device, dtype, output_dir)
     (output_dir / "all_checkpoint_results.json").write_text(
         json.dumps(all_results, indent=2)
