@@ -102,7 +102,7 @@ class Config:
         default_factory=lambda: [1.0, 1.3, 1.6, 2.0, 2.5, 3.0]
     )
     trajectory_window: int = 10
-    trajectory_splits: int = 10
+    trajectory_splits: int = 12
     sampled_instants: int = 10
     initial_conditions_per_alpha: int = 10
     integration_dt: float = 0.1
@@ -143,11 +143,11 @@ class Config:
     # see the integrator_substeps note above for the accuracy/speed tradeoff this involves).
     r_peri_min: float = 0.1
     r_peri_max: float = 1.2
-    r_apo_max: float = 2.0
+    r_apo_max: float = 3.0
     # Fraction of windows per orbit deliberately time-shifted so periapsis passage falls near
     # the window's middle (guaranteeing the network actually trains on that orbit's closest
     # approach); the rest use a uniformly random phase across the full orbital period.
-    periapsis_centered_fraction: float = 0.1
+    periapsis_centered_fraction: float = 0.2
     cm_box: float = 0.8
 
     # --- "box_sampler" generator fields (two_body_dynamics.generate_initial_conditions) ---
@@ -175,7 +175,7 @@ class Config:
     training_steps: int = 5000
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    l1_weight: float = 1e-5
+    l1_weight: float = 5e-4
     # Clips the total gradient norm before every optimizer step. Needed here specifically:
     # verified in a real run (session that added this field) that Adam took one catastrophic
     # step mid-training (trajectory loss 0.00009 -> 0.011 between two consecutive steps) and
