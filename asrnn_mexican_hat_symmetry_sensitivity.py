@@ -635,7 +635,7 @@ def plot_summary(all_results: list[dict[str, Any]], output_dir: Path) -> None:
     for ax in axes.flat:
         ax.axvline(0.0, color="0.45", linestyle=":", linewidth=1.2)
         ax.set_xlabel(r"$\alpha$")
-    axes[0, 0].legend(fontsize=7, ncol=2)
+    axes[0, 0].legend(ncol=2)
     fig.savefig(output_dir / "mexican_hat_summary.png", dpi=200)
     fig.savefig(output_dir / "mexican_hat_summary.pdf")
     plt.close(fig)
@@ -679,7 +679,7 @@ def plot_equivariance_by_module(all_results: list[dict[str, Any]], output_dir: P
     ax.bar(x - width / 2, before, width, label=f"step {first['step']} (random init)")
     ax.bar(x + width / 2, after, width, label=f"step {last['step']} (trained)")
     ax.set_xticks(x)
-    ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right", fontsize=8)
+    ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right")
     ax.set(ylabel="mean $E_i$ within module")
     ax.grid(alpha=0.25, axis="y")
     ax.legend()
@@ -800,7 +800,7 @@ def plot_module_attribution(
     ax.bar(x - width / 2, before, width, label=f"step {first['step']} (random init)")
     ax.bar(x + width / 2, after, width, label=f"step {last['step']} (trained)")
     ax.set_xticks(x)
-    ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right", fontsize=8)
+    ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right")
     ax.set(ylabel=r"$\|c_i\|$ within module")
     ax.grid(alpha=0.25, axis="y")
     ax.legend()
@@ -856,11 +856,11 @@ def plot_module_symmetry_comparison(
         ax.bar(x - width / 2, rotation_by_module, width, label=r"rotation ($X_{\rm rot}F$)")
         ax.bar(x + width / 2, energy_by_module, width, label="time-translation (energy conservation)")
         ax.set_xticks(x)
-        ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right", fontsize=8)
+        ax.set_xticklabels([prettify_parameter_name(m, modules) for m in modules], rotation=60, ha="right")
         ax.set(ylabel="attribution norm within module")
-        ax.set_title(subtitle, fontsize=10)
+        ax.set_title(subtitle)
         ax.grid(alpha=0.25, axis="y")
-    axes[0].legend(fontsize=8)
+    axes[0].legend()
     fig.savefig(output_dir / "module_symmetry_comparison.png", dpi=200, bbox_inches="tight")
     fig.savefig(output_dir / "module_symmetry_comparison.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -893,9 +893,9 @@ def plot_symmetry_attribution_scatter(
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set(xlabel=r"rotation attribution $|c_i|$", ylabel=r"energy-conservation attribution $|c_i|$")
-        ax.set_title(subtitle, fontsize=10)
+        ax.set_title(subtitle)
         ax.grid(alpha=0.25, which="both")
-    axes[1].legend(fontsize=7, ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    axes[1].legend(ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.savefig(output_dir / "symmetry_attribution_scatter.png", dpi=200, bbox_inches="tight")
     fig.savefig(output_dir / "symmetry_attribution_scatter.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -986,7 +986,7 @@ def plot_learned_force_field(
             if col == 0:
                 ax.annotate(
                     title, xy=(-0.35, 0.5), xycoords="axes fraction", rotation=90,
-                    ha="center", va="center", fontsize=11,
+                    ha="center", va="center",
                 )
             ax.set_aspect("equal")
 
@@ -1049,7 +1049,7 @@ def plot_learned_potential(
             if col == 0:
                 ax.annotate(
                     title, xy=(-0.4, 0.5), xycoords="axes fraction", rotation=90,
-                    ha="center", va="center", fontsize=11,
+                    ha="center", va="center",
                 )
             ax.set_aspect("equal")
         # One colorbar per alpha column (each alpha has its own vmax after baseline-shifting,
