@@ -1,290 +1,261 @@
-# Where Does a Network's Symmetry Live? A Gauge-Critical Study of Functional Sensitivity
+# Symmetry Is Not Localised in Parameter Space
 
-*(working title — alt: "Symmetry Without a Subnetwork: What Functional Sensitivity Can and Cannot Localise in Learned Maps for Symmetric Physical Systems")*
-
-Target venue: NeurReps 2026. Status: outline for internal review, built from the
-2026-08-19/20 audit of the SCML draft. Every quantitative claim below is
-computed and reproducible in this repo (`NOTES_gauge_and_conditioning.md` has
-proofs; scripts are named per section).
+**NeurReps 2026 — paper outline.** Workshop format (~9pp incl. refs), can be cut down to a 4 page extended abstract.
 
 ---
 
-## 0. One-paragraph pitch
+## Thesis
 
-Parameter-wise functional sensitivity (Muriithi & Thapar, SCML draft) proposes
-that projecting a symmetry generator onto a network's tangent space and reading
-off the minimum-norm coefficients identifies *which parameters realise* a
-learned symmetry. We show this specific construction is not well-posed: the
-projection is a choice among a continuum of equally valid solutions (a gauge
-choice), and the "concentrated subnetwork" it reports is reproduced identically
-by a random target and by the Jacobian's conditioning alone, with no
-symmetry-specific content. We give the exact algebraic reason, a full
-gauge/reparametrisation/permutation audit, and a battery of causal controls,
-converging on where localisation *does* hold — hidden-unit and module
-granularity, not individual weights — and on a genuinely new phenomenon: in a
-converged, near-equivariant network, symmetry control is not merely
-under-concentrated but *statistically indistinguishable from a matched
-non-symmetry null*, having become substantially coextensive with control of the
-task loss itself. We reframe functional sensitivity's contribution accordingly
-and show what remains true, well-posed, and useful: an exactly invariant
-per-parameter equivariance defect (`E_i`), a rank-based order parameter for
-symmetry representability, and a description of how localisation dissolves
-over training.
+> The apparent localisation of a learned symmetry to a few parameters is an
+> artifact of the attribution construction. Measured against matched nulls, the
+> symmetry-generator direction is among the **least** localised directions in a
+> converged network's tangent space — and it becomes less localised, not more,
+> as the network becomes equivariant.
+
+Everything below serves that sentence. The negative half is fully established
+(theorem + measurement, two models). The positive half — *delocalisation over
+training* — is the payoff and is what makes this a result rather than a
+critique.
 
 ---
 
-## 1. Introduction
+## 1. Introduction (0.75pp)
 
-- Motivating question, as originally posed: for a network that has learned a
-  physical symmetry, can functional sensitivity say *which parameters* are
-  responsible?
-- State the paper's actual contribution up front: a structural obstruction
-  to the claim in the SCML manuscript, an exact decomposition explaining it, a
-  full audit of what survives, and a new empirical phenomenon (delocalisation
-  under training) that the audit surfaces.
-- Position relative to prior functional-sensitivity work and to the geometric
-  deep learning / symmetry-detection literature: most existing work asks
-  *whether* a network is equivariant; we ask a finer question — *where*, in
-  parameter space, does equivariance (or its violation) live — and show that
-  question is only well-posed at certain granularities.
+- The question: for a network that has learned a physical symmetry, can we say
+  *which parameters* realise it? Recent work (our own SCML draft included)
+  answers by projecting the generator onto the functional tangent space and
+  reading off minimum-norm coefficients `c = J⁺g`, observing that `|c_i|` is
+  sharply concentrated.
+- We show that concentration is not evidence about symmetry: it is reproduced
+  exactly by a random target and by the Jacobian's conditioning with no target
+  at all. The underlying reason is structural, not statistical.
+- Contributions:
+  1. An exact factorisation of the attribution into a symmetry-dependent and a
+     **target-independent** conditioning factor, and the observation that the
+     latter dominates after convergence (R² = 0.91).
+  2. A gauge analysis: `Jc = g` is underdetermined by ~4500 dimensions, and the
+     two most natural norm choices return **disjoint** parameter sets.
+  3. Causal tests with sensitivity-matched controls, showing the published
+     score has *exactly zero* causal effect on equivariance.
+  4. The positive result: symmetry-specific concentration is real in an
+     untrained network and vanishes as the network becomes equivariant —
+     symmetry control is absorbed into task control.
+  5. Concrete recommendations for what to report instead, all of which we show
+     to be invariant.
 
-## 2. Framework
+## 2. Setup (0.75pp)
 
-### 2.1 Functional tangent space and symmetry generators (inherited from the draft)
-- $f_\theta$, $S_i = \partial f_\theta/\partial\theta_i$, $T_\theta =
-  \mathrm{Im}(J_\theta)$.
-- Continuous generator $X$, intrinsic direction $g = Xf_\theta$.
-- Truncated-SVD resolution of $T_\theta$ at a relative cutoff (numerical
-  necessity, but see §3.3 — it is not gauge-neutral).
+- `f_θ`, sensitivities `S_i`, tangent space `T_θ = Im(J_θ)`, truncated SVD.
+- Generator `X`, intrinsic direction `g = Xf_θ`; group average `Π`, defect
+  `δ = (I−Π)f_θ`.
+- **Prop. 0** (from Torben's critique): `⟨δ, g⟩ = 0`. `g` is tangent to the
+  group orbit at constant distance from `ker X` — it measures orbit phase, not
+  distance from equivariance. Attribution of `g` therefore cannot license
+  claims about symmetry *breaking*; that requires `δ`.
+- Benchmarks: Mexican-hat (SO(2)) and two-body (rotation only — `Π` needs a
+  compact group, so translation is out of scope by construction). ASRNN and
+  MLP. Two models at matched convergence (loss 6.4–6.7e-5, equivariance
+  residual 4.2e-3 and 9.1e-3) — squarely the regime the claim is about.
 
-### 2.2 The $g$ vs. $\delta$ split (from Torben's critique, Prop. 1)
-- Group average $\Pi f = \frac{1}{2\pi}\int \rho(h_\phi)^{-1} f(h_\phi\cdot x)\,d\phi$,
-  defect $\delta = (I-\Pi)f_\theta$.
-- $\langle \delta, g\rangle = 0$: $g$ is tangent to the group orbit at *constant*
-  distance from the equivariant subspace; it measures orbit phase, not distance
-  from equivariance. $\delta$ is the object that licenses "symmetry breaking"
-  language.
-- **Consequence for the draft's §4 claim**: "perturbing high-$c_i$ parameters
-  contributes to symmetry breaking" is a non sequitur under this framework —
-  attribution of $g$ says nothing about $\delta$. Verified: perturbing the
-  draft's own top-20 gives $\Delta\log D = 0.0000$ exactly. [Double Check]
+## 3. The attribution is a gauge choice (2pp — theory core)
 
-### 2.3 Parameter attribution and its solution set (new)
-- $J_\theta c \approx g$ is underdetermined; minimum-norm attribution
-  $c^\star = \arg\min\{\lVert Dc\rVert_2 : V_r c = \alpha\}$ for a diagonal
-  metric $D$.
-- **Proposition (closed form).** $c_i = a_i/d_i^2$ where $a_i = \langle
-  V_{:,i}, u\rangle$ is target-dependent and $d_i^{-2}$ is *exactly*
-  target-independent. (Verified to $6\times10^{-16}$.)
-- **Corollary (exact null calibration).** The conditioning factor cancels
-  exactly in a ratio of attributions against two targets, giving a
-  provably conditioning-free score $r_i$.
-- **Proposition (gauge dependence).** Different valid choices of $D$ select
-  different points of a $(P-r)$-dimensional solution set; no choice is neutral.
-- **Proposition (reparametrisation).** Three independent sources break
-  covariance under $\theta_i \mapsto \lambda_i\theta_i$: the minimised norm
-  itself, the *relative* SVD truncation, and (an implementation-specific,
-  fixable point) the dead-column floor.
-- **Proposition (permutation).** Individual parameter indices are not
-  well-posed targets for a localisation claim; hidden units are the finest
-  granularity the network's own symmetry group admits.
-- **Contrast.** $E_i$ (sensitivity-equivariance defect, draft §2.3) is built
-  from column norms alone, with no optimisation and no truncation — exactly
-  invariant under every transformation above (verified $2.8\times10^{-15}$).
-  This is the theoretical heart of "what survives."
+**3.1 Underdetermination.** rank(J) = 22 against 4514 parameters (2221 live).
+Solution set is 4492-dimensional; every point reproduces the identical `P_T g`.
+Refining the probe grid 96 → 1792 rows leaves rank at 22 — intrinsic, not
+undersampling.
 
-### 2.4 Rank as an order parameter (new)
-- $\mathrm{rank}(J_\theta)$ relative to $P$ is a gauge-free, reparametrisation-
-  invariant, permutation-invariant description of *how much* of parameter
-  space the network's tangent space actually occupies — independent of probe
-  grid resolution once resolved (verified stable 96–1792 probe rows).
-- Frame this as the paper's replacement order parameter for "concentration":
-  not which parameters, but how many independent directions.
+**3.2 Prop. 1 (conditioning–alignment factorisation).** With column
+normalisation, `c_i = a_i / ‖S_i‖²` where `a_i = ⟨V_{:,i}, u⟩` is the only
+target-dependent factor. Verified 6×10⁻¹⁶. **Corollary**: the conditioning
+factor cancels *exactly* in a ratio of attributions against two targets,
+giving a provably conditioning-free score (verified 4×10⁻¹⁶).
 
-## 3. Why the naive attribution fails: theory + diagnostics
+**3.3 Prop. 2–4 (gauge and covariance).** Under `θ_i ↦ λ_iθ_i` the true
+coefficients must transform as `c ↦ Λc`. Three independent sources break this:
+the minimised norm (`‖c‖₂` is not covariant); the *relative* SVD truncation
+(rank 22 vs 19 under the same reparametrisation, and covariance returns only at
+cutoff 10⁻¹², where truncation no longer does its job); and — an
+implementation point worth fixing — a dead-column floor defined relative to the
+largest column.
 
-### 3.1 The conditioning confound is exact, not a modelling worry
-- Full-scale measurement: $R^2(\log|c_i| \sim \log\lVert S_i\rVert) = 0.906$;
-  worsens with convergence (0.15 toy → 0.91 full scale, because training
-  spreads $\lVert S_i\rVert$ over 8 decades).
-- Sparsity claim does not survive a null: top-10% share is 99.9% for the true
-  generator, 99.9% for a matched-construction null, 100.0% for the conditioning
-  factor alone with *no target at all*.
-- Correction of the co-author critique's proposed fix ($\tilde a_i$): exactly
-  removes the conditioning confound (slope $0.000$) but does *not* address
-  gauge dependence (§3.2) — these are different problems with different fixes.
+**3.4 Prop. 5 (no neutral gauge).** Under `‖D^s c‖₂` the explicit factor is
+`d_i^{−2s}`, so every choice takes a side: `s=0` (the published `J⁺g`) favours
+the *most* sensitive parameters (ρ=+0.92), `s=1` the *least* (ρ=−0.88),
+`s=½` is neutral (ρ=+0.04).
 
-### 3.2 Gauge dependence, measured
-- Solution-set dimension at full scale: 4492 of 4514.
-- Cross-gauge top-20 overlap: mean 0.140; the draft's $J^+g$ and this
-  codebase's column-normalised default share **zero** parameters.
-- Every gauge trades off along the conditioning axis ($w{=}1$: $\rho=+0.92$
-  toward high-sensitivity params; $w{=}\lVert S_i\rVert$: $\rho=-0.88$ toward
-  low-sensitivity; $w{=}\lVert S_i\rVert^{1/2}$: near-neutral, $\rho=+0.04$).
+**3.5 Prop. 6 (permutation).** Hidden-unit permutation leaves `f_θ` unchanged,
+so parameter indices are not well-posed targets for localisation. The hidden
+unit is the finest permutation-equivariant granularity.
 
-### 3.3 Reparametrisation covariance, three sources separated
-- Table of departure-from-covariance across the three sources (norm choice,
-  truncation, dead-column floor), each isolated.
-- $E_i$ as the invariant contrast.
+**3.6 Prop. 7 (the contrast).** `E_i` is built from column norms of two
+Jacobians with no optimisation and no truncation — exactly invariant
+(2.8×10⁻¹⁵) under the same reparametrisation that moves `c_i` by ~1.0.
 
-### 3.4 Identifiability under resampling
-- Probe-row bootstrap with a **null-vs-null control** ($r'$) providing the
-  noise floor, at both parameter and hidden-unit granularity.
-- Grid-refinement sweep (96→1792 rows): resolved rank constant at 22
-  throughout — the underdetermination is intrinsic, not a small-sample
-  artifact. $|c_i|$'s apparent convergence under refinement is inherited from
-  $\lVert S_i\rVert$'s convergence, not the symmetry's.
+## 4. What the measurements show (2.5pp — experiments)
 
-### 3.5 Causal tests
-- Order parameter $D = \lVert\delta\rVert^2/\lVert f\rVert^2$, differentiable in
-  $\theta$; $\nabla_\theta D$ as exact per-parameter causal ground truth.
-- Sensitivity-matched ablation (nearest-neighbour control in $\log\lVert
-  S_i\rVert$, validated by construction: the conditioning score itself gets
-  zero excess).
-- Result: $|\langle S_i, g\rangle|$ (alignment, gauge-free) shows a
-  reproducible positive causal excess over the matched control; the draft's own
-  $c^\star = J^+g$ shows **exactly zero** effect.
-- Disjoint-block test: several non-overlapping aligned blocks each show
-  positive excess, at different magnitudes — the controlling set is causally
-  real but **not unique**, consistent with $\sim$100-fold parameter
-  substitutability implied by rank 22 / 2221 live parameters.
+**4.1 The concentration is not about symmetry.** Top 10% of parameters carry
+99.9% of `|c_i|` for the true generator — 99.9% for a matched-construction
+null, 100.0% for `1/‖S_i‖²` alone. R²(log|c_i| ~ log‖S_i‖) = 0.906, and this
+*worsens with convergence* (0.15 on a lightly-trained model → 0.91 at
+convergence, because training spreads `‖S_i‖` over eight decades).
 
-## 4. What survives: localisation at the right granularity
+**4.2 Gauge disagreement, measured.** Mean cross-gauge top-20 Jaccard 0.140;
+the published `J⁺g` and the column-normalised default share **zero**
+parameters. The proposed scale-invariant fix `ã_i` removes the conditioning
+confound exactly (slope −0.000) but not the gauge problem (0.187).
 
-### 4.1 Module and hidden-unit level
-- Cross-gauge Spearman: parameter level $+0.16$, hidden-unit level $+0.71$,
-  module level $+0.87$ — **caveat, stated honestly**: module-level correlation
-  is close to saturated by a null-vs-null control (0.995) and should not be
-  over-claimed; the genuine signal is hidden-unit-level *set overlap*
-  (Jaccard $0.514$ vs. null $0.397$; $0.65$ vs. $0.09$ under grid refinement).
-- Permutation argument (§2.3) as the principled reason this is the right
-  granularity, not merely the empirically convenient one.
+**4.3 Causal tests.** Order parameter `D = ‖δ‖²/‖f‖²`, differentiable, with
+`∇_θD` as exact per-parameter causal ground truth, and a **sensitivity-matched
+control** (nearest-neighbour in log‖S_i‖) that validates itself — `‖S_i‖`, which
+carries no symmetry information, scores zero excess.
+- Conditioning alone predicts causal influence at ρ = +0.934.
+- The published score's top-20, perturbed, gives **Δlog D = 0.0000** — exactly
+  no effect, because that gauge selects near-dead parameters.
+- Alignment `|⟨S_i, g⟩|` does show a positive excess over the matched control,
+  replicated across both models.
+- Disjoint blocks by alignment rank each show positive excess at comparable
+  magnitude, and the top block is not privileged — the controlling set is
+  causally real but **not unique**, as ~100-fold substitutability (2221 live
+  parameters, rank 22) predicts.
 
-### 4.2 Sufficiency vs. influence — a genuine dissociation
-- Two distinct questions: how many parameters are *causally influential* for
-  the symmetry (diffuse: $n_\text{eff}\approx 365$ of 2221, indistinguishable
-  from task-loss influence, $n_\text{eff}\approx 837$) vs. how many are
-  *sufficient* to reproduce $P_T g$ via gauge-free greedy subset selection
-  (OMP against a matched-null reference).
-- Report the sufficiency result honestly: in the converged model, the rotation
-  generator required **more** parameters/units than matched non-symmetry nulls
-  to reach a given reconstruction tolerance ($z < 0$ throughout) — the
-  symmetry direction is *harder*, not easier, to reconstruct sparsely, because
-  in a near-equivariant network $g$ is a small, unstructured residual spread
-  across the resolved tangent space while generic targets load onto dominant
-  singular directions.
-- This directly falsifies the "small subset suffices" framing at the level of
-  generality the draft claims, and should be stated as a finding, not buried.
+**4.3b Identifiability under resampling.** Bootstrap 80% of probe rows, 40
+draws, with two reference points: `‖S_i‖` (target-blind, trivially stable — the
+"easy" level) and a **null-vs-null calibration** `r′` with the same estimator
+and denominator noise as the conditioning-free score but no symmetry signal —
+the noise floor.
 
-### 4.3 Delocalisation over training (the paper's positive empirical result)
-- Matched non-symmetry null $E(M) = \lVert f(Mx)-Mf(x)\rVert^2/\lVert
-  f\rVert^2$ for random non-orthogonal $M$, differentiable, defined without a
-  group average.
-- Checkpoint sweep, untrained → trained:
-  - Untrained (equivariance error 1.50): symmetry-specific concentration is
-    real, $z=+3.00$ vs. matched null; symmetry and task control are
-    decoupled ($\rho=-0.06$).
-  - Trained (equivariance error $8.2\times10^{-5}$): $z=+0.24$
-    (indistinguishable from null); symmetry and task control have become
-    substantially coextensive ($\rho=+0.30$).
-- **Interpretation offered as the paper's central positive claim**: training on
-  a symmetric system does not carve out a dedicated symmetry-realising
-  subnetwork; it progressively *absorbs* symmetry-control into general task
-  control, until the two are no longer separable by any attribution method
-  tested. This is a mechanistic, falsifiable claim about how symmetry is
-  learned, distinct from (and we argue more interesting than) "here is the
-  subnetwork."
-- Extend to intermediate checkpoints (currently only endpoints run) for a
-  proper trend with error bars before submission.
+| score | top-20 Jaccard, parameters | top-19, hidden units |
+|---|---|---|
+| `‖S_i‖` (conditioning reference) | 0.776 | 0.935 |
+| `\|c_i\|` (the published score) | **0.748** | 0.881 |
+| `r_i` (conditioning-free) | 0.072 | **0.514** |
+| `r′_i` (null-vs-null control) | 0.063 | 0.397 |
 
-## 5. A bounded, explicitly-scoped positive demonstration
+`|c_i|` looks robust and lands within noise of the conditioning reference it is
+largely made of; the conditioning-free part sits at its own noise floor. Only at
+unit granularity does the symmetry-specific score clear its control. Together
+with §3.1 (grid refinement) and §4.2 (gauge), this is the third independent leg
+under "the parameter-level identity is not a property of the network".
 
-- In one specific trained instance, at one fixed, stated gauge
-  ($|\langle S_i,g\rangle|$, the only gauge that survives the causal test), an
-  explicit 20-parameter subset shows a reproducible, causally-verified,
-  positive effect on the symmetry defect beyond a sensitivity-matched control
-  ($\Delta\log D \approx +0.14$ to $+0.65$ across scales and seeds).
-- **Explicitly bracketed limitations, stated in the same breath as the
-  result**: not invariant under gauge (§3.2), reparametrisation (§3.3), or
-  permutation (§4.1); the *specific identity* of the 20 parameters is expected
-  to change under retraining even though the *phenomenon* (a causally
-  effective subset exists) should not — recommend a second-seed replication
-  figure showing a different index set with the same causal signature as the
-  paired demonstration of this point.
-- Framed as an existence proof and a template for circuit-style intervention
-  work, not as a general property of the architecture. Kept small: one figure,
-  one paragraph, placed after the negative/structural results.
+**4.4 Sufficiency vs. influence — and both point the same way.** These are
+distinct questions and we test both.
+- *Influence* is diffuse: n_eff(∇D) ≈ 365 of 2221, versus 837 for the task
+  loss — barely more concentrated than the network's general behaviour.
+- *Sufficiency*, via gauge-free greedy subset selection against matched nulls:
+  the true generator needs **more** parameters than a non-symmetry target
+  (19 vs 3.2 for 10% error; z = −16). In a near-equivariant network `g` is a
+  small unstructured residual spread across the tangent space, while a generic
+  target loads onto the dominant singular directions.
+- Both routes agree, which is the thesis.
 
-## 6. Discussion
+**4.5 The positive result: delocalisation over training.** Matched null
+`E(M) = ‖f(Mx) − Mf(x)‖²/‖f‖²` for random non-orthogonal `M` — same functional
+as the true rotation, defined without a group average.
 
-- Restate the central methodological lesson for the NeurReps audience: a
-  representation-theoretic quantity (here, minimum-norm coefficients from an
-  SVD-truncated pseudoinverse) can look like a geometric, basis-free object
-  while silently encoding a metric choice on parameter space that the theory
-  never fixes. This is a failure mode likely to recur anywhere a symmetry
-  generator is projected onto an *overparameterised, rank-deficient* tangent
-  space — i.e., essentially always, for modern networks.
-- Keeping from the original framework: $E_i$ without
-  qualification; $P_T g$ and the representation residual; rank as an order
-  parameter; module/unit-level localisation with the appropriate null.
-- What to drop or heavily qualify: parameter-level
-  attribution via any single minimum-norm solve, and any inference from
-  attribution magnitude to "symmetry breaking" (that requires $\delta$, not
-  $g$).
-- Limitations: two benchmark systems (Mexican-hat, two-body — rotation only,
-  since $\Pi/\delta$ needs a compact group), one architecture family (ASRNN
-  vs. MLP), single-digit training seeds for the causal/matched results.
-- Future work (explicitly deferred, per scope decision): an exact mechanism for
-  parameter-level attribution that survives gauge and permutation (if one
-  exists — we suspect not, given §3, but a *subspace*-valued attribution that
-  reports an equivalence class rather than a point might); disentangling
-  symmetry-specific sensitivity from general sensitivity more finely than the
-  matched-null approach here; the role of optimisation dynamics (does SGD's
-  own implicit bias, not just convergence, drive the delocalisation of §4.3?).
+| | equivariance error | concentration z vs null | ρ(∇symm, ∇task) |
+|---|---|---|---|
+| untrained | 1.50 | **+3.00** | −0.06 |
+| trained | 8.2×10⁻⁵ | **+0.24** | +0.30 |
 
-## 7. Appendix (or supplementary)
+At initialisation symmetry control is concentrated in a symmetry-specific way
+and is decoupled from task control. After training to equivariance it is
+indistinguishable from the null and substantially coextensive with the task.
+Note the *function* is emphatically symmetric (E under the true rotation is
+8×10⁻⁵ against 8×10⁻² for random `M`): it is the localisation of control, not
+the symmetry, that dissolves. **Interpretation:** training on a symmetric
+system does not carve out a symmetry subnetwork — it absorbs symmetry into
+general task competence.
 
-- Full proposition list with proofs and verification residuals
-  (from `NOTES_gauge_and_conditioning.md`).
-- Two-body extension: rotation-only $\Pi/\delta$ split (translation excluded,
-  non-compact group), as a second-system robustness check for §2.2/§3.
-- Full script-to-result mapping table for reproducibility.
+## 5. What to report instead (0.75pp)
+
+- **`E_i`** — exactly invariant; the published Fig. 1b stands without
+  qualification where Fig. 1a does not.
+- **Function-space quantities**: `P_T g`, the representation residual
+  `‖P_{T⊥}g‖/‖g‖` (currently unreported, and it *degrades* to 0.12–0.24 in the
+  low-equivariance regime), and `‖g‖`, `‖δ‖` as order parameters.
+- **rank(J)** as the well-posed concentration statement — gauge-,
+  reparametrisation-, permutation-, and grid-invariant.
+- **Hidden-unit granularity**, via set overlap rather than correlation. (Module-
+  level *correlation* is saturated — a null-vs-null control scores 0.995 — and
+  must not be over-claimed. The genuine signal is unit-level Jaccard: 0.514 vs
+  null 0.397, and 0.65 vs 0.09 under grid refinement.)
+- **A matched null in every figure** — the difference between a claim about
+  symmetry and a claim about conditioning.
+
+## 6. Discussion (0.5pp)
+
+- The general lesson for this venue: a quantity can look basis-free (an SVD, a
+  pseudo-inverse, a projection onto a tangent space) while silently encoding a
+  metric on parameter space that the theory never fixes. This failure mode
+  should be expected wherever a generator is projected onto an
+  overparameterised, rank-deficient tangent space — i.e. essentially always.
+- Limitations: two systems, one architecture family, few seeds; the causal
+  effect sizes are noisy (see open items); two-body covers rotation only.
+- Future work, explicitly deferred: a subspace-valued attribution reporting an
+  equivalence class rather than a point; disentangling symmetry-specific from
+  general sensitivity beyond the matched-null approach; whether SGD's implicit
+  bias, not merely convergence, drives §4.5.
 
 ---
 
-## Mapping: claims → evidence → script
+## Optional §5.5 — a bounded, explicitly-scoped demonstration
+
+*(Include only if space permits; one figure, one paragraph, placed after the
+negative results.)* In one trained instance at one fixed gauge, an explicit
+20-parameter subset (of 4514) shows a causally-verified positive effect on the
+symmetry defect beyond a sensitivity-matched control. Framed as an existence
+proof — such subsets exist and can be verified — with the identity explicitly
+disclaimed as non-invariant under §3.3–3.5. **Requires** the second-seed
+replication showing a *different* index set with the same causal signature;
+without that pairing it reads as the very claim §3–4 refute.
+
+---
+
+## Claims we make / do not make
+
+| We claim | We do not claim |
+|---|---|
+| `\|c_i\|`'s concentration is reproduced by nulls and by conditioning | that `c_i` is uninformative about the network in every respect |
+| the parameter-level *identity* is gauge-dependent | that no parameter subset has causal effect |
+| alignment-selected subsets causally affect equivariance | that they are unique, or reproducible across seeds |
+| symmetry-specific concentration falls as equivariance improves | that the symmetry itself weakens (it strengthens by 3 orders) |
+| `E_i`, rank, `P_T g` are invariant | that they answer "which parameters" |
+
+## Figures (5)
+
+1. The factorisation: `log|c_i|` vs `log‖S_i‖`, with `|a_i|` and `|ã_i|` —
+   slopes −0.99 / +1.01 / −0.000.
+2. Lorenz curves: true generator vs matched null vs `1/‖S_i‖²` alone.
+3. Cross-gauge overlap matrix (8 gauges), with the disjoint pair highlighted.
+4. Causal: matched-control excess by score, with the published score at zero.
+5. **Headline** — delocalisation: concentration z and ρ(symm,task) against
+   equivariance error across training.
+
+## Claim → evidence → script
 
 | Claim | Evidence | Script |
 |---|---|---|
-| Conditioning factorisation is exact | residual $6\times10^{-16}$ | `causal_symmetry_control.py`, `conditioning_decomposition.py` |
-| Null-calibrated score cancels exactly | residual $4\times10^{-16}$ | `causal_symmetry_control.py` |
-| Gauge dependence | solution-set dim, cross-gauge Jaccard/Spearman | `gauge_dependence.py` |
-| Reparametrisation, 3 sources | departure-from-covariance table | `reparametrisation_covariance.py` |
-| $E_i$ invariance | $2.8\times10^{-15}$ | `reparametrisation_covariance.py` |
-| Identifiability under resampling | Jaccard vs. null-vs-null control | `attribution_stability.py` |
-| Grid-refinement convergence | rank stability, top-k convergence | `probe_grid_sweep.py` |
-| Causal excess (sensitivity-matched) | $\Delta\log D$ excess table | `causal_matched_ablation.py`, `causal_symmetry_control.py` |
-| Disjoint-block non-uniqueness | block-wise excess | `disjoint_sets_control.py` |
-| Sufficiency vs. influence dissociation | $n_\text{eff}$, OMP $k^\star$ vs. null | `symmetry_concentration.py`, `symmetry_subspace_sparsity.py` |
-| Delocalisation over training | $z$-score, $\rho$(symm,task) at 2 checkpoints (extend to full sweep) | `symmetry_concentration_null.py` |
-| Module/unit granularity | cross-gauge $\rho$, unit Jaccard | `gauge_dependence.py`, `attribution_stability.py` |
-| $\Pi/\delta$ split, Prop. 1 | $\cos(\text{angle}) \approx 10^{-8}$ | `pi_delta_split.py`, `pi_delta_split_two_body.py` |
+| conditioning factorisation is exact | residual 6×10⁻¹⁶ | `conditioning_decomposition.py` |
+| null calibration cancels it exactly | residual 4×10⁻¹⁶ | `causal_symmetry_control.py` |
+| gauge dependence | solution-set dim, cross-gauge Jaccard | `gauge_dependence.py` |
+| covariance breaks, 3 sources | departure table | `reparametrisation_covariance.py` |
+| `E_i` invariance | 2.8×10⁻¹⁵ | `reparametrisation_covariance.py` |
+| identifiability vs null floor | Jaccard table, §4.3b | `attribution_stability.py` |
+| rank stable under grid refinement | 96→1792 rows, rank 22 | `probe_grid_sweep.py` |
+| causal excess, matched control | Δlog D excess by score | `causal_matched_ablation.py` |
+| controlling set non-unique | disjoint-block excess | `disjoint_sets_control.py` |
+| influence diffuse; sufficiency worse than null | n_eff; OMP k*(ε) vs nulls | `symmetry_concentration.py`, `symmetry_subspace_sparsity.py` |
+| delocalisation over training | z, ρ(symm,task) vs equivariance | `delocalisation_sweep.py` |
+| Prop. 0 (⟨δ,g⟩=0) | cos ≈ 10⁻⁸, both systems | `pi_delta_split.py`, `pi_delta_split_two_body.py` |
 
----
+Proofs and verification residuals: `NOTES_gauge_and_conditioning.md`.
 
-## Open items before a submittable draft
+## Open items before submission
 
-1. **Extend §4.3 to a full checkpoint sweep** (currently only untrained/trained
-   endpoints) — needed to state the delocalisation trend as a measured curve
-   rather than two points.
-2. **Second-seed replication of §5's bounded demonstration** — the pending
-   paired figure showing the causal phenomenon survives while the specific
-   index set does not.
-3. **Error bars on the causal-ablation excess numbers** — current SEs cover
-   variation across matched controls only, not across perturbation draws or
-   seeds; the same top-20 set gave $+0.58$ in one run and $+0.14$ in another.
-4. Decide whether the two-body/translation-excluded results belong in the main
-   text (a second system strengthens generality) or purely in the appendix.
-5. Settle the title and framing: "what survives" vs. "delocalisation" as the
-   headline — current draft above leads with the negative/structural result
-   and treats delocalisation as the positive payoff; could be inverted.
+1. **Fig. 5 needs the full checkpoint sweep** — currently two endpoints; the
+   13-checkpoint run is in progress.
+2. **Error bars on the causal excess** — current SEs cover matched-control
+   variation only; the same top-20 gave +0.58 and +0.14 on two runs. Needs
+   variance over perturbation draws and seeds.
+3. **Second seed** for §5.5, or drop §5.5.
+4. Decide whether two-body goes in the main text or appendix.
