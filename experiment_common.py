@@ -19,6 +19,43 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from sensitivity_tools import choose_l1_ratio_for_sparsity, tangent_projection_auto
+
+
+def resolve_attribution_coefficients(
+    cfg: Any,
+    l1_ratio_cache: dict[str, float],
+    cache_key: str,
+    jacobian: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[float, float, torch.Tensor, int, list[float]]:
+    """Shared ``tangent_projection_auto`` call site for the ASRNN experiment scripts.
+
+    Dispatches on ``cfg.attribution_method`` ("l2", "l1", or "elastic_net",
+    the default). For elastic net, the ``l1_ratio`` (chosen so its support
+    is comparably sparse to pure L1, with the least ridge admixture needed
+    for tie-breaking among (near-)collinear parameter columns -- see
+    ``sensitivity_tools.choose_l1_ratio_for_sparsity``) is calibrated once
+    per ``cache_key`` (typically one per symmetry generator, e.g. "xrot",
+    "bifurcation", "energy") from the first Jacobian/target pair seen for
+    that key, and reused for every subsequent alpha/checkpoint under that
+    key -- avoiding a fresh ~10-point grid search (each point itself an
+    ADMM solve) on every single call, and keeping the hyperparameter fixed
+    across the whole analysis so results stay comparable across alphas and
+    checkpoints.
+    """
+    method = getattr(cfg, "attribution_method", "elastic_net")
+    if method != "elastic_net":
+        return tangent_projection_auto(jacobian, target, cfg.tangent_svd_relative_cutoff, method=method)
+    if cache_key not in l1_ratio_cache:
+        l1_ratio_cache[cache_key] = choose_l1_ratio_for_sparsity(
+            jacobian, target, cfg.tangent_svd_relative_cutoff
+        )
+    return tangent_projection_auto(
+        jacobian, target, cfg.tangent_svd_relative_cutoff,
+        method="elastic_net", l1_ratio=l1_ratio_cache[cache_key],
+    )
+
 
 def set_paper_style() -> None:
     """One shared, consistent look for every plot in this project (fonts, spines, grid).

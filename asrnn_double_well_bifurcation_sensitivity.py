@@ -47,6 +47,7 @@ from experiment_common import (
     parameter_layout,
     plot_ei_initial_vs_final,
     plot_training_history,
+    resolve_attribution_coefficients,
     run_training_loop,
     select_device,
     select_dtype,
@@ -61,7 +62,6 @@ from sensitivity_tools import (
     per_parameter_equivariance_error,
     relative_energy_drift,
     sensitivity_transform_residual,
-    tangent_projection,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -160,6 +160,12 @@ class Config:
     # network can trivially span every point on a finite q grid at initialisation.
     tangent_svd_relative_cutoff: float = 1e-3
     top_parameters_to_report: int = 20
+    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
+    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
+    # sparse but can arbitrarily zero one of several collinear parameters), or
+    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
+    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
+    attribution_method: str = "elastic_net"
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,6 +187,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
+    parser.add_argument(
+        "--attribution-method",
+        choices=["l2", "l1", "elastic_net"],
+        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
+    )
     return parser.parse_args()
 
 
@@ -195,6 +206,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.architecture = args.architecture
     if args.augment_dataset is not None:
         cfg.augment_dataset = args.augment_dataset
+    if args.attribution_method:
+        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -222,6 +235,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("trajectory_splits must be at least 1.")
     if cfg.q_probe_points < 2:
         raise ValueError("q_probe_points must be at least 2.")
+    if cfg.attribution_method not in {"l2", "l1", "elastic_net"}:
+        raise ValueError("attribution_method must be 'l2', 'l1', or 'elastic_net'.")
     if not math.isclose(cfg.q_min, -cfg.q_max, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("Parity analysis requires a symmetric q interval: q_min=-q_max.")
     if cfg.potential_plot_points < 2:
@@ -415,8 +430,11 @@ def analyse_checkpoint(
     dtype: torch.dtype,
     flat_names: list[str],
     parameter_slices: dict[str, slice],
+    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
+    if attribution_l1_ratio_cache is None:
+        attribution_l1_ratio_cache = {}
     q_values = torch.linspace(
         cfg.q_min, cfg.q_max, cfg.q_probe_points, device=device, dtype=dtype
     )
@@ -488,8 +506,8 @@ def analyse_checkpoint(
             coefficients,
             resolved_rank,
             singular_values,
-        ) = tangent_projection(
-            jacobian, bifurcation_direction, cfg.tangent_svd_relative_cutoff
+        ) = resolve_attribution_coefficients(
+            cfg, attribution_l1_ratio_cache, "bifurcation", jacobian, bifurcation_direction
         )
         sensitivity = torch.sqrt(torch.mean(jacobian.detach().cpu().double().square(), dim=0))
         curvature, curvature_gradient = curvature_and_parameter_gradient(
@@ -919,6 +937,7 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
+    attribution_l1_ratio_cache: dict[str, float] = {}
     for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
         result = analyse_checkpoint(
@@ -929,6 +948,7 @@ def train_and_analyse(cfg: Config) -> None:
             dtype,
             flat_names,
             parameter_slices,
+            attribution_l1_ratio_cache,
         )
         write_checkpoint_outputs(result, output_dir)
         all_results.append(result)

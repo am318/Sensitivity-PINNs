@@ -48,6 +48,7 @@ from experiment_common import (
     plot_ei_initial_vs_final,
     plot_training_history,
     prettify_parameter_name,
+    resolve_attribution_coefficients,
     run_training_loop,
     select_device,
     select_dtype,
@@ -63,7 +64,6 @@ from sensitivity_tools import (
     per_parameter_equivariance_error,
     relative_energy_drift,
     sensitivity_transform_residual,
-    tangent_projection,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -170,6 +170,12 @@ class Config:
     # numerically resolved tangent space (see double-well script for why).
     tangent_svd_relative_cutoff: float = 1e-3
     top_parameters_to_report: int = 20
+    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
+    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
+    # sparse but can arbitrarily zero one of several collinear parameters), or
+    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
+    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
+    attribution_method: str = "elastic_net"
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,6 +194,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
+    parser.add_argument(
+        "--attribution-method",
+        choices=["l2", "l1", "elastic_net"],
+        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
+    )
     return parser.parse_args()
 
 
@@ -204,6 +215,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.l1_weight = args.l1_weight
     if args.architecture:
         cfg.architecture = args.architecture
+    if args.attribution_method:
+        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -234,6 +247,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
     if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
             raise ValueError("checkpoint_fractions must all lie in [0, 1].")
+    if cfg.attribution_method not in {"l2", "l1", "elastic_net"}:
+        raise ValueError("attribution_method must be 'l2', 'l1', or 'elastic_net'.")
     cfg.checkpoint_steps = sorted(
         {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
@@ -456,8 +471,11 @@ def analyse_checkpoint(
     dtype: torch.dtype,
     flat_names: list[str],
     parameter_slices: dict[str, slice],
+    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
+    if attribution_l1_ratio_cache is None:
+        attribution_l1_ratio_cache = {}
     q1_grid, q2_grid = build_probe_grid(cfg, device, dtype)
     rot_mat = rotation_matrix(cfg.rotation_angle_degrees, device, dtype)
     refl_mat = reflection_matrix(device, dtype)
@@ -557,7 +575,9 @@ def analyse_checkpoint(
                 coupling_coefficients,
                 coupling_resolved_rank,
                 coupling_singular_values,
-            ) = tangent_projection(jac_flat, target_flat, cfg.tangent_svd_relative_cutoff)
+            ) = resolve_attribution_coefficients(
+                cfg, attribution_l1_ratio_cache, "coupling", jac_flat, target_flat
+            )
             result.update(
                 {
                     "coupling_projection_error": coupling_projection_error,
@@ -586,7 +606,9 @@ def analyse_checkpoint(
                 xrot_control_coefficients,
                 xrot_control_resolved_rank,
                 xrot_control_singular_values,
-            ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
+            ) = resolve_attribution_coefficients(
+                cfg, attribution_l1_ratio_cache, "xrot_control", jac_flat, xrot_target_flat
+            )
             result.update(
                 {
                     "xrot_control_projection_error": xrot_control_projection_error,
@@ -934,9 +956,12 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
+    attribution_l1_ratio_cache: dict[str, float] = {}
     for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
-        result = analyse_checkpoint(model, step, cfg, device, dtype, flat_names, parameter_slices)
+        result = analyse_checkpoint(
+            model, step, cfg, device, dtype, flat_names, parameter_slices, attribution_l1_ratio_cache
+        )
         write_checkpoint_outputs(result, output_dir)
         all_results.append(result)
 

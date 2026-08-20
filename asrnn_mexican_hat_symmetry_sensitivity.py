@@ -49,6 +49,7 @@ from experiment_common import (
     plot_magnitude_vs_quantity,
     plot_training_history,
     prettify_parameter_name,
+    resolve_attribution_coefficients,
     run_training_loop,
     select_device,
     select_dtype,
@@ -74,7 +75,6 @@ from sensitivity_tools import (
     principal_angles_and_dimension,
     relative_energy_drift,
     sensitivity_transform_residual,
-    tangent_projection,
     parameter_magnitude_ci_correlation,
 )
 
@@ -148,6 +148,12 @@ class Config:
     tangent_svd_relative_cutoff: float = 1e-3
     representation_angle_threshold_degrees: float = 10.0
     top_parameters_to_report: int = 20
+    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
+    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
+    # sparse but can arbitrarily zero one of several collinear parameters), or
+    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
+    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
+    attribution_method: str = "elastic_net"
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
+    parser.add_argument(
+        "--attribution-method",
+        choices=["l2", "l1", "elastic_net"],
+        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
+    )
     return parser.parse_args()
 
 
@@ -180,6 +191,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.l1_weight = args.l1_weight
     if args.augment_dataset is not None:
         cfg.augment_dataset = args.augment_dataset
+    if args.attribution_method:
+        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -209,6 +222,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
     if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
         raise ValueError("checkpoint_fractions must all lie in [0, 1].")
+    if cfg.attribution_method not in {"l2", "l1", "elastic_net"}:
+        raise ValueError("attribution_method must be 'l2', 'l1', or 'elastic_net'.")
     cfg.checkpoint_steps = sorted(
         {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
@@ -299,6 +314,50 @@ def rotation_generator_target(
     directional = torch.einsum("nkj,nj->nk", spatial_jacobian, omega_q)
     omega = ROTATION_LIE_GENERATOR.to(device=force.device, dtype=force.dtype)
     return directional - force @ omega.T
+
+
+def group_average_and_defect(
+    model: torch.nn.Module, q1_pts: torch.Tensor, q2_pts: torch.Tensor, alpha: float, architecture: str,
+    *, device: torch.device, dtype: torch.dtype, n_quadrature: int = 24,
+):
+    """Pi f_theta (SO(2) group average) and delta = f_theta - Pi f_theta = Q f_theta, with Jacobians.
+
+    Implements the review notes' split (Prop. 1: <delta, g> = <delta, X delta>
+    = 0, so g = X f_theta is tangent to the group orbit at *constant*
+    distance from the equivariant subspace E = ker X -- it measures orbit
+    "phase", not distance from equivariance, and does not by itself license
+    "symmetry breaking" language). ``delta`` is the actual departure from E;
+    its own attribution (via the same tangent-space machinery, using
+    ``j_delta`` as the Jacobian) is what licenses that language.
+
+    Pi f(q) = (1/2pi) integral rho(h_phi)^{-1} f(h_phi . q) dphi, approximated
+    by an ``n_quadrature``-point equally-spaced sum over rotation angles;
+    rho(h_phi) = R_phi acts on the 2D force output the same way it acts on
+    q. Since differentiation w.r.t. theta commutes with the average, the
+    Jacobian of Pi f is just the same average applied to J(h_phi . q) --
+    the code below computes f and J at each rotated point (reusing
+    ``evaluate_at_points``) and averages both, rotating each by R_phi^{-1}
+    before accumulating.
+
+    Returns ``(f_x, j_x, pi_f, j_pi, delta, j_delta)``, shapes ``[N,2]``,
+    ``[N,2,P]``, ``[N,2]``, ``[N,2,P]``, ``[N,2]``, ``[N,2,P]``.
+    """
+    v_x, f_x, j_x = evaluate_at_points(model, q1_pts, q2_pts, alpha, architecture, device=device, dtype=dtype)
+    pi_f = torch.zeros_like(f_x)
+    pi_j = torch.zeros_like(j_x)
+    for k in range(n_quadrature):
+        theta_degrees = 360.0 * k / n_quadrature
+        r_phi = rotation_matrix(theta_degrees, device, dtype)
+        q1_rot, q2_rot = transform_points(q1_pts, q2_pts, r_phi)
+        _, f_rot, j_rot = evaluate_at_points(model, q1_rot, q2_rot, alpha, architecture, device=device, dtype=dtype)
+        r_inv = r_phi.T  # orthogonal matrix: inverse = transpose
+        pi_f = pi_f + f_rot @ r_inv.T
+        pi_j = pi_j + torch.einsum("dc,ncp->ndp", r_inv, j_rot)
+    pi_f = pi_f / n_quadrature
+    pi_j = pi_j / n_quadrature
+    delta = f_x - pi_f
+    j_delta = j_x - pi_j
+    return f_x, j_x, pi_f, pi_j, delta, j_delta
 
 
 def evaluate_at_points(
@@ -410,8 +469,11 @@ def evaluate_energy_drift_jacobian(
 def analyse_checkpoint(
     model: torch.nn.Module, step: int, cfg: Config, device: torch.device, dtype: torch.dtype,
     flat_names: list[str], parameter_slices: dict[str, slice],
+    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
+    if attribution_l1_ratio_cache is None:
+        attribution_l1_ratio_cache = {}
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1_grid, q2_grid = build_probe_grid(cfg, device, dtype)
     rot_mat = rotation_matrix(cfg.rotation_angle_degrees, device, dtype)
@@ -442,14 +504,16 @@ def analyse_checkpoint(
         (
             bifurcation_projection_error, bifurcation_principal_angle,
             bifurcation_coefficients, bifurcation_resolved_rank, bifurcation_singular_values,
-        ) = tangent_projection(jac_flat, bifurcation_target_flat, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(
+            cfg, attribution_l1_ratio_cache, "bifurcation", jac_flat, bifurcation_target_flat
+        )
 
         xrot_target = rotation_generator_target(q1_grid, q2_grid, f_x, spatial_jac_x)
         xrot_target_flat = xrot_target.reshape(n_points * 2)
         (
             xrot_projection_error, xrot_principal_angle,
             xrot_coefficients, xrot_resolved_rank, xrot_singular_values,
-        ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(cfg, attribution_l1_ratio_cache, "xrot", jac_flat, xrot_target_flat)
 
         generator_matrix = torch.stack([bifurcation_target_flat, xrot_target_flat], dim=1)
         dimension_info = principal_angles_and_dimension(
@@ -472,7 +536,9 @@ def analyse_checkpoint(
         (
             energy_projection_error, energy_principal_angle,
             energy_coefficients, energy_resolved_rank, energy_singular_values,
-        ) = tangent_projection(energy_drift_jacobian, energy_drift_values, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(
+            cfg, attribution_l1_ratio_cache, "energy", energy_drift_jacobian, energy_drift_values
+        )
 
         alpha_results.append(
             {
@@ -1094,9 +1160,15 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
+    # Shared across all checkpoints/alphas so the elastic-net l1_ratio (per
+    # generator direction) is calibrated once for the whole run, not
+    # re-searched on every call -- see resolve_attribution_coefficients.
+    attribution_l1_ratio_cache: dict[str, float] = {}
     for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
-        result = analyse_checkpoint(model, step, cfg, device, dtype, flat_names, parameter_slices)
+        result = analyse_checkpoint(
+            model, step, cfg, device, dtype, flat_names, parameter_slices, attribution_l1_ratio_cache
+        )
         write_checkpoint_outputs(result, output_dir)
         all_results.append(result)
 

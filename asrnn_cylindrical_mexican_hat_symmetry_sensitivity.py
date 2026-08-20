@@ -59,6 +59,7 @@ from experiment_common import (
     plot_magnitude_vs_quantity,
     plot_training_history,
     prettify_parameter_name,
+    resolve_attribution_coefficients,
     run_training_loop,
     select_device,
     select_dtype,
@@ -75,7 +76,6 @@ from sensitivity_tools import (
     per_parameter_equivariance_error,
     relative_energy_drift,
     sensitivity_transform_residual,
-    tangent_projection,
 )
 
 
@@ -135,6 +135,12 @@ class Config:
 
     tangent_svd_relative_cutoff: float = 1e-3
     top_parameters_to_report: int = 20
+    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
+    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
+    # sparse but can arbitrarily zero one of several collinear parameters), or
+    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
+    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
+    attribution_method: str = "elastic_net"
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,6 +153,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
+    parser.add_argument(
+        "--attribution-method",
+        choices=["l2", "l1", "elastic_net"],
+        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +174,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.l1_weight = args.l1_weight
     if args.augment_dataset is not None:
         cfg.augment_dataset = args.augment_dataset
+    if args.attribution_method:
+        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -191,6 +204,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("q_grid_points_per_axis and z_grid_points must be at least 2.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
+    if cfg.attribution_method not in {"l2", "l1", "elastic_net"}:
+        raise ValueError("attribution_method must be 'l2', 'l1', or 'elastic_net'.")
     cfg.checkpoint_steps = sorted(
         {int(s) for s in cfg.checkpoint_steps if 0 <= int(s) <= cfg.training_steps}
         | {0, cfg.training_steps}
@@ -341,8 +356,11 @@ def learned_dqdt(model: torch.nn.Module, p1, p2, p3, alpha: float, architecture:
 def analyse_checkpoint(
     model: torch.nn.Module, step: int, cfg: Config, device: torch.device, dtype: torch.dtype,
     flat_names: list[str], parameter_slices: dict[str, slice],
+    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
+    if attribution_l1_ratio_cache is None:
+        attribution_l1_ratio_cache = {}
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1_grid, q2_grid, q3_grid = build_probe_grid(cfg, device, dtype)
     rot_mat = rotation_matrix_3d(cfg.rotation_angle_degrees, device, dtype)
@@ -375,7 +393,7 @@ def analyse_checkpoint(
         translation_sensitivity_residual = sensitivity_transform_residual(j_x, j_shift, None)
         translation_equivariance_error = per_parameter_equivariance_error(j_x, j_shift, None)
 
-        sensitivity = torch.sqrt(torch.mean(j_x.double().square(), dim=(0, 1)))
+        sensitivity = torch.sqrt(torch.mean(j_x.detach().cpu().double().square(), dim=(0, 1)))
         jac_flat = j_x.reshape(n_points * 3, -1)
 
         xrot_target = rotation_generator_target(q1_grid, q2_grid, q3_grid, f_x, spatial_jac_x)
@@ -383,14 +401,14 @@ def analyse_checkpoint(
         (
             xrot_projection_error, xrot_principal_angle,
             xrot_coefficients, xrot_resolved_rank, xrot_singular_values,
-        ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(cfg, attribution_l1_ratio_cache, "xrot", jac_flat, xrot_target_flat)
 
         xtrans_target = translation_generator_target(spatial_jac_x)
         xtrans_target_flat = xtrans_target.reshape(n_points * 3)
         (
             xtrans_projection_error, xtrans_principal_angle,
             xtrans_coefficients, xtrans_resolved_rank, xtrans_singular_values,
-        ) = tangent_projection(jac_flat, xtrans_target_flat, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(cfg, attribution_l1_ratio_cache, "xtrans", jac_flat, xtrans_target_flat)
 
         learned_dqdt_values = learned_dqdt(model, p1_grid, p2_grid, p3_grid, alpha, cfg.architecture)
         grad_e_q = float(alpha) * torch.stack([q1_grid, q2_grid, torch.zeros_like(q3_grid)], dim=1) + (
@@ -398,7 +416,8 @@ def analyse_checkpoint(
             * torch.stack([q1_grid, q2_grid, torch.zeros_like(q3_grid)], dim=1)
         )
         energy_conservation_violation = relative_energy_drift(
-            grad_e_p.double(), grad_e_q.double(), f_x.double(), learned_dqdt_values.double()
+            grad_e_p.detach().cpu().double(), grad_e_q.detach().cpu().double(),
+            f_x.detach().cpu().double(), learned_dqdt_values.detach().cpu().double()
         )
 
         alpha_results.append(
@@ -721,9 +740,12 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
+    attribution_l1_ratio_cache: dict[str, float] = {}
     for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
-        result = analyse_checkpoint(model, step, cfg, device, dtype, flat_names, parameter_slices)
+        result = analyse_checkpoint(
+            model, step, cfg, device, dtype, flat_names, parameter_slices, attribution_l1_ratio_cache
+        )
         write_checkpoint_outputs(result, output_dir)
         all_results.append(result)
 

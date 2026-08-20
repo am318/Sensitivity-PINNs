@@ -52,6 +52,7 @@ from experiment_common import (
     plot_magnitude_vs_quantity,
     plot_training_history,
     prettify_parameter_name,
+    resolve_attribution_coefficients,
     run_training_loop,
     select_device,
     select_dtype,
@@ -68,7 +69,6 @@ from sensitivity_tools import (
     per_parameter_equivariance_error,
     relative_energy_drift,
     sensitivity_transform_residual,
-    tangent_projection,
 )
 from two_body_dynamics import (
     F,
@@ -219,6 +219,12 @@ class Config:
 
     tangent_svd_relative_cutoff: float = 1e-3
     top_parameters_to_report: int = 20
+    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
+    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
+    # sparse but can arbitrarily zero one of several collinear parameters), or
+    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
+    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
+    attribution_method: str = "elastic_net"
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,6 +238,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
+    parser.add_argument(
+        "--attribution-method",
+        choices=["l2", "l1", "elastic_net"],
+        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
+    )
     return parser.parse_args()
 
 
@@ -250,6 +261,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.l1_weight = args.l1_weight
     if args.augment_dataset is not None:
         cfg.augment_dataset = args.augment_dataset
+    if args.attribution_method:
+        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -275,6 +288,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("trajectory_splits must be at least 1.")
     if cfg.q_grid_points_per_axis < 2 or cfg.cm_grid_points < 2:
         raise ValueError("q_grid_points_per_axis and cm_grid_points must be at least 2.")
+    if cfg.attribution_method not in {"l2", "l1", "elastic_net"}:
+        raise ValueError("attribution_method must be 'l2', 'l1', or 'elastic_net'.")
     if any(a <= 0 for a in cfg.training_alphas) or any(a <= 0 for a in cfg.analysis_alphas):
         raise ValueError("alpha must be strictly positive (attractive coupling) for bound closed orbits to exist.")
     if not 0.0 < cfg.tangent_svd_relative_cutoff < 1.0:
@@ -414,6 +429,67 @@ def translation_generator_target(spatial_jacobian, direction: torch.Tensor) -> t
     return -torch.einsum("nkj,j->nk", spatial_jacobian, direction)
 
 
+def build_polar_probe_grid_rotation_invariant(
+    n_radii: int, n_angles: int, r_max: float, device: torch.device, dtype: torch.dtype
+):
+    """Rotation-invariant probe set for the g-vs-delta split (see the Mexican-hat script's
+    build_polar_probe_grid for why this matters -- the group-average/Prop. 1 identity
+    requires an invariant probe measure, which the square Cartesian build_probe_grid is not).
+
+    Fixes the centre of mass at the origin (q1 = -q2 = r/2 on a circle) rather than
+    building a joint (relative, CM) polar grid: the potential V = -alpha/|q1-q2| only
+    depends on the relative separation, so CM position is physically irrelevant to the
+    rotational structure being tested here, and fixing it at the origin (itself trivially
+    rotation-invariant, being a single fixed point) keeps the grid small while remaining
+    exactly invariant under any rotation by a multiple of 360/n_angles degrees.
+    """
+    radii = torch.linspace(r_max / n_radii, r_max, n_radii, device=device, dtype=dtype)
+    angles = torch.linspace(0, 2 * math.pi, n_angles + 1, device=device, dtype=dtype)[:-1]
+    r_grid, a_grid = torch.meshgrid(radii, angles, indexing="ij")
+    rx = (r_grid * torch.cos(a_grid)).reshape(-1)
+    ry = (r_grid * torch.sin(a_grid)).reshape(-1)
+    q1x, q1y = 0.5 * rx, 0.5 * ry
+    q2x, q2y = -0.5 * rx, -0.5 * ry
+    return q1x, q1y, q2x, q2y
+
+
+def group_average_and_defect(
+    model: torch.nn.Module, q1x, q1y, q2x, q2y, alpha: float, architecture: str,
+    *, device: torch.device, dtype: torch.dtype, n_quadrature: int = 24,
+):
+    """Pi f_theta (SO(2) group average) and delta = f_theta - Pi f_theta, with Jacobians.
+
+    Rotation-only: translation is a noncompact group (unbounded R^2), so the
+    group-average integral (1/|G|) integral rho(h)^{-1} f(h.x) dh does not
+    converge for it the way it does for the compact SO(2) rotation group --
+    this construction is mathematically well-posed only for the rotation
+    generator here, by design (see the Mexican-hat script's
+    group_average_and_defect for the full derivation/Prop. 1).
+
+    Returns ``(f_x, j_x, pi_f, j_pi, delta, j_delta)``, shapes ``[N,4]``,
+    ``[N,4,P]``, ``[N,4]``, ``[N,4,P]``, ``[N,4]``, ``[N,4,P]``.
+    """
+    v_x, f_x, j_x = evaluate_at_points(model, q1x, q1y, q2x, q2y, alpha, architecture, device=device, dtype=dtype)
+    pi_f = torch.zeros_like(f_x)
+    pi_j = torch.zeros_like(j_x)
+    for k in range(n_quadrature):
+        theta_degrees = 360.0 * k / n_quadrature
+        r_phi = rotation_matrix_2d(theta_degrees, device, dtype)
+        rep_phi = rotation_rep_matrix_4d(r_phi)
+        q1x_r, q1y_r, q2x_r, q2y_r = rotate_points(q1x, q1y, q2x, q2y, r_phi)
+        _, f_rot, j_rot = evaluate_at_points(
+            model, q1x_r, q1y_r, q2x_r, q2y_r, alpha, architecture, device=device, dtype=dtype
+        )
+        rep_inv = rep_phi.T  # orthogonal: inverse = transpose
+        pi_f = pi_f + f_rot @ rep_inv.T
+        pi_j = pi_j + torch.einsum("dc,ncp->ndp", rep_inv, j_rot)
+    pi_f = pi_f / n_quadrature
+    pi_j = pi_j / n_quadrature
+    delta = f_x - pi_f
+    j_delta = j_x - pi_j
+    return f_x, j_x, pi_f, pi_j, delta, j_delta
+
+
 def evaluate_at_points(
     model: torch.nn.Module, q1x_pts, q1y_pts, q2x_pts, q2y_pts, alpha: float, architecture: str,
     *, device: torch.device, dtype: torch.dtype, need_spatial_jacobian: bool = False,
@@ -473,8 +549,11 @@ def learned_dqdt(model: torch.nn.Module, p1x, p1y, p2x, p2y, alpha: float, archi
 def analyse_checkpoint(
     model: torch.nn.Module, step: int, cfg: Config, device: torch.device, dtype: torch.dtype,
     flat_names: list[str], parameter_slices: dict[str, slice],
+    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
+    if attribution_l1_ratio_cache is None:
+        attribution_l1_ratio_cache = {}
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1x_grid, q1y_grid, q2x_grid, q2y_grid = build_probe_grid(cfg, device, dtype)
     rot_mat = rotation_matrix_2d(cfg.rotation_angle_degrees, device, dtype)
@@ -522,14 +601,14 @@ def analyse_checkpoint(
         (
             xrot_projection_error, xrot_principal_angle,
             xrot_coefficients, xrot_resolved_rank, xrot_singular_values,
-        ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(cfg, attribution_l1_ratio_cache, "xrot", jac_flat, xrot_target_flat)
 
         xtrans_target = translation_generator_target(spatial_jac_x, translation_direction)
         xtrans_target_flat = xtrans_target.reshape(n_points * 4)
         (
             xtrans_projection_error, xtrans_principal_angle,
             xtrans_coefficients, xtrans_resolved_rank, xtrans_singular_values,
-        ) = tangent_projection(jac_flat, xtrans_target_flat, cfg.tangent_svd_relative_cutoff)
+        ) = resolve_attribution_coefficients(cfg, attribution_l1_ratio_cache, "xtrans", jac_flat, xtrans_target_flat)
 
         learned_dqdt_values = learned_dqdt(model, p1x_grid, p1y_grid, p2x_grid, p2y_grid, alpha, cfg.architecture)
         grad_e_p = torch.stack([p1x_grid, p1y_grid, p2x_grid, p2y_grid], dim=1)
@@ -1157,9 +1236,12 @@ def train_and_analyse(cfg: Config) -> None:
     plot_training_history(history, output_dir)
 
     all_results = []
+    attribution_l1_ratio_cache: dict[str, float] = {}
     for step in tqdm(sorted(checkpoint_states.keys()), desc="checkpoint analysis", unit="checkpoint"):
         model.load_state_dict(checkpoint_states[step])
-        result = analyse_checkpoint(model, step, cfg, device, dtype, flat_names, parameter_slices)
+        result = analyse_checkpoint(
+            model, step, cfg, device, dtype, flat_names, parameter_slices, attribution_l1_ratio_cache
+        )
         write_checkpoint_outputs(result, output_dir)
         all_results.append(result)
 
