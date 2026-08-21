@@ -19,6 +19,36 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+
+def set_paper_style() -> None:
+    """One shared, consistent look for every plot in this project (fonts, spines, grid).
+
+    Called once at import time below, so every script that imports anything
+    from this module picks it up automatically -- edit the values here to
+    change font sizes/colours/etc. everywhere at once. Anything not covered
+    by an rcParam (e.g. the categorical module colour palette) lives in
+    ``module_colours`` just below.
+    """
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.titlesize": 11,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 9,
+        "figure.dpi": 150,
+        "savefig.dpi": 200,
+        "savefig.bbox": "tight",
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.axisbelow": True,
+    })
+
+
+set_paper_style()
+
 from sensitivity_tools import choose_l1_ratio_for_sparsity, tangent_projection_auto
 
 
@@ -56,35 +86,6 @@ def resolve_attribution_coefficients(
         method="elastic_net", l1_ratio=l1_ratio_cache[cache_key],
     )
 
-
-def set_paper_style() -> None:
-    """One shared, consistent look for every plot in this project (fonts, spines, grid).
-
-    Called once at import time below, so every script that imports anything
-    from this module picks it up automatically -- edit the values here to
-    change font sizes/colours/etc. everywhere at once. Anything not covered
-    by an rcParam (e.g. the categorical module colour palette) lives in
-    ``module_colours`` just below.
-    """
-    plt.rcParams.update({
-        "font.size": 11,
-        "axes.titlesize": 11,
-        "axes.labelsize": 12,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "legend.fontsize": 9,
-        "figure.dpi": 150,
-        "savefig.dpi": 200,
-        "savefig.bbox": "tight",
-        "axes.grid": True,
-        "grid.alpha": 0.25,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "axes.axisbelow": True,
-    })
-
-
-set_paper_style()
 
 
 def _net_layer_index(name: str, prefix: str) -> int | None:
@@ -441,13 +442,13 @@ def plot_ei_initial_vs_final(
         sl = parameter_slices[name]
         ax.scatter(
             ei_initial[sl], ei_final[sl], s=14, color=colours[name],
-            label=prettify_parameter_name(name, modules), alpha=0.75, edgecolors="none",
+            label=prettify_parameter_name(name, modules), alpha=0.6, edgecolors="none",
         )
 
     if log_scale:
         lower = float(min(ei_initial.min(), ei_final.min())) / 1.5
         upper = float(max(ei_initial.max(), ei_final.max())) * 1.5
-        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="$y=x$")
+        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="$y=x$", alpha=1)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set(xlim=(lower, upper), ylim=(lower, upper))
@@ -458,6 +459,74 @@ def plot_ei_initial_vs_final(
     ax.set(xlabel=f"{quantity_label} at random init", ylabel=f"{quantity_label} at final checkpoint")
     ax.set_aspect("equal")
     ax.grid(alpha=0.25, which="both" if log_scale else "major")
+    ax.legend(ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def robust_linthresh(values: np.ndarray) -> float:
+    """Default symlog linthresh: the smallest nonzero |value|, but ignoring anything below
+    a relative noise floor (max(|values|) * 1e-8).
+
+    Attribution coefficients for structurally-zero parameters (see
+    ``_exclude_structurally_zero`` callers) are exactly zero *mathematically*, but the
+    truncated-SVD pseudoinverse that computes them leaves float round-off residue at the
+    ~1e-15--1e-17 level rather than an exact 0.0. Taking the plain nonzero minimum as
+    linthresh picks up that residue and stretches the symlog linear region to cover ~15
+    decades of pure noise, crushing every genuine value into an unreadable sliver at the
+    plot's edges. A generous 1e-8 relative floor is far above float64 round-off but far
+    below any of this project's genuine small attribution values (which are typically
+    within 2-4 decades of the largest coefficient, not 8+).
+    """
+    nonzero_abs = np.abs(values[values != 0])
+    if not nonzero_abs.size:
+        return 1e-12
+    noise_floor = float(nonzero_abs.max()) * 1e-8
+    above_floor = nonzero_abs[nonzero_abs > noise_floor]
+    return float(above_floor.min()) if above_floor.size else float(nonzero_abs.min())
+
+
+def plot_signed_initial_vs_final(
+    values_initial: np.ndarray,
+    values_final: np.ndarray,
+    parameter_slices: dict[str, slice],
+    *,
+    output_stem: Path,
+    quantity_label: str = "$c_i$",
+    linthresh: float | None = None,
+) -> None:
+    """Signed companion to ``plot_ei_initial_vs_final``: same init-vs-trained scatter, but
+    keeps sign information via a symmetric-log ("symlog") scale instead of taking |.| and
+    plotting on an ordinary log scale. Useful for attribution coefficients (c_i, b_i), whose
+    *sign* indicates the direction a parameter would need to move to realise the target (the
+    infinitesimal generator g, or the equivariance defect delta), not just how much.
+    """
+    fig, ax = plt.subplots(figsize=(7.5, 7), constrained_layout=True)
+    modules = list(parameter_slices.keys())
+    colours = module_colours(modules)
+
+    both = np.concatenate([values_initial, values_final])
+    if linthresh is None:
+        linthresh = robust_linthresh(both)
+    bound = float(max(np.abs(both).max(), linthresh)) * 1.5
+
+    for name in modules:
+        sl = parameter_slices[name]
+        ax.scatter(
+            values_initial[sl], values_final[sl], s=14, color=colours[name],
+            label=prettify_parameter_name(name, modules), alpha=0.6, edgecolors="none",
+        )
+
+    ax.plot([-bound, bound], [-bound, bound], "k--", linewidth=1, label="$y=x$")
+    ax.axhline(0, color="0.6", linewidth=0.8, zorder=0)
+    ax.axvline(0, color="0.6", linewidth=0.8, zorder=0)
+    ax.set_xscale("symlog", linthresh=linthresh)
+    ax.set_yscale("symlog", linthresh=linthresh)
+    ax.set(xlim=(-bound, bound), ylim=(-bound, bound))
+    ax.set(xlabel=f"{quantity_label} at random init", ylabel=f"{quantity_label} at final checkpoint")
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.25, which="both")
     ax.legend(ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
     fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
@@ -506,6 +575,107 @@ def plot_magnitude_vs_quantity(
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set(xlabel=x_label, ylabel=quantity_label)
+        ax.set_title(subtitle)
+        ax.grid(alpha=0.25, which="both")
+    axes[1].legend(ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_signed_magnitude_vs_quantity(
+    magnitude_initial: np.ndarray,
+    magnitude_final: np.ndarray,
+    quantity_initial: np.ndarray,
+    quantity_final: np.ndarray,
+    parameter_slices: dict[str, slice],
+    *,
+    quantity_label: str,
+    output_stem: Path,
+    x_label: str = r"$|\theta_i|$ (parameter magnitude)",
+    linthresh: float | None = None,
+) -> None:
+    """Signed companion to ``plot_magnitude_vs_quantity``: x stays log-scaled (magnitude-like
+    quantities -- |theta_i|, S_i -- are never negative), but y keeps its sign via a symlog
+    scale instead of being floored and log-scaled. Useful for attribution coefficients
+    (c_i, b_i) plotted against magnitude/sensitivity, where the sign of the coefficient
+    carries information (which direction a parameter would move) that |.| discards.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), constrained_layout=True)
+    modules = list(parameter_slices.keys())
+    colours = module_colours(modules)
+
+    both_q = np.concatenate([quantity_initial, quantity_final])
+    if linthresh is None:
+        linthresh = robust_linthresh(both_q)
+
+    for ax, x_values, quantity, subtitle in (
+        (axes[0], magnitude_initial, quantity_initial, "random init"),
+        (axes[1], magnitude_final, quantity_final, "trained"),
+    ):
+        for name in modules:
+            sl = parameter_slices[name]
+            ax.scatter(
+                np.maximum(x_values[sl], 1e-12), quantity[sl],
+                s=14, color=colours[name], label=prettify_parameter_name(name, modules),
+                alpha=0.75, edgecolors="none",
+            )
+        ax.set_xscale("log")
+        ax.set_yscale("symlog", linthresh=linthresh)
+        ax.axhline(0, color="0.6", linewidth=0.8, zorder=0)
+        ax.set(xlabel=x_label, ylabel=quantity_label)
+        ax.set_title(subtitle)
+        ax.grid(alpha=0.25, which="both")
+    axes[1].legend(ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.savefig(output_stem.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_both_signed_quantity(
+    x_initial: np.ndarray,
+    x_final: np.ndarray,
+    y_initial: np.ndarray,
+    y_final: np.ndarray,
+    parameter_slices: dict[str, slice],
+    *,
+    x_label: str,
+    y_label: str,
+    output_stem: Path,
+    x_linthresh: float | None = None,
+    y_linthresh: float | None = None,
+) -> None:
+    """Doubly-signed companion to ``plot_magnitude_vs_quantity``/``plot_signed_magnitude_vs_quantity``:
+    both axes keep their sign via symlog, for pairs where *neither* quantity is a genuine
+    non-negative magnitude -- e.g. the raw (signed) parameter value theta_i against a signed
+    per-parameter sensitivity, or c_i/b_i against that same signed sensitivity. Unlike
+    ``plot_signed_magnitude_vs_quantity`` (x log, y symlog), this makes no assumption that
+    either axis is one-signed.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), constrained_layout=True)
+    modules = list(parameter_slices.keys())
+    colours = module_colours(modules)
+
+    if x_linthresh is None:
+        x_linthresh = robust_linthresh(np.concatenate([x_initial, x_final]))
+    if y_linthresh is None:
+        y_linthresh = robust_linthresh(np.concatenate([y_initial, y_final]))
+
+    for ax, x_values, y_values, subtitle in (
+        (axes[0], x_initial, y_initial, "random init"),
+        (axes[1], x_final, y_final, "trained"),
+    ):
+        for name in modules:
+            sl = parameter_slices[name]
+            ax.scatter(
+                x_values[sl], y_values[sl], s=14, color=colours[name],
+                label=prettify_parameter_name(name, modules), alpha=0.75, edgecolors="none",
+            )
+        ax.axhline(0, color="0.6", linewidth=0.8, zorder=0)
+        ax.axvline(0, color="0.6", linewidth=0.8, zorder=0)
+        ax.set_xscale("symlog", linthresh=x_linthresh)
+        ax.set_yscale("symlog", linthresh=y_linthresh)
+        ax.set(xlabel=x_label, ylabel=y_label)
         ax.set_title(subtitle)
         ax.grid(alpha=0.25, which="both")
     axes[1].legend(ncol=1, loc="upper left", bbox_to_anchor=(1.02, 1.0))

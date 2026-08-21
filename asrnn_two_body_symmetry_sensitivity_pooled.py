@@ -1,4 +1,19 @@
-"""Functional-sensitivity experiment for the planar two-body problem, kept in the full 8D lab frame.
+"""POOLED-DIRECTION variant of asrnn_two_body_symmetry_sensitivity.py, for direct comparison.
+
+The only difference from the un-suffixed sibling script: for each symmetry (rotation,
+translation), c_i (generator attribution) and b_i (equivariance-defect attribution) are each
+solved ONCE per checkpoint from a single combined least-squares system that stacks
+Jacobian/target rows across every alpha in cfg.training_alphas union cfg.analysis_alphas,
+instead of being solved independently at each analysis alpha and then RMS-aggregated into a
+magnitude-only "score" afterward. See analyse_checkpoint's "Pooled c_i/b_i" block for the full
+rationale (in short: a per-alpha c_i, if ever used as an actual parameter-space step, gives a
+different perturbed model at each alpha, which isn't one coherent direction; pooling first
+avoids that -- same reasoning as the mexican-hat pooled script). Run with the SAME config.json
+as an existing un-suffixed run (same seed => same training trajectory, since training itself
+never touches c_i/b_i) to get a directly comparable set of plots differing only in this one
+definitional choice.
+
+Functional-sensitivity experiment for the planar two-body problem, kept in the full 8D lab frame.
 
 The physical system is
 
@@ -54,7 +69,6 @@ from experiment_common import (
     plot_signed_initial_vs_final,
     plot_training_history,
     prettify_parameter_name,
-    resolve_attribution_coefficients,
     robust_linthresh,
     run_training_loop,
     select_device,
@@ -91,9 +105,9 @@ class Config:
     seed: int = 42
     device: str = "auto"
     dtype: str = "float32"
-    output_dir: str = "outputs/asrnn_two_body_symmetry"
+    output_dir: str = "outputs/asrnn_two_body_symmetry_pooled"
 
-    architecture: str = "hamiltonian"  # hamiltonian, direct_mlp, or equivariant
+    architecture: str = "equivariant"  # hamiltonian, direct_mlp, or equivariant
 
     kinetic_hidden_dim: int = 32
     kinetic_hidden_layers: int = 3
@@ -221,11 +235,6 @@ class Config:
     # for why (translation is non-compact, so it uses the probe grid's own finite CM extent
     # instead of a tunable discretisation of a convergent integral).
     orbit_average_n_phi: int = 64
-    # Angular resolution (shared by the relative vector's angle and the CM offset's angle) of
-    # build_rotation_probe_grid, the rotation-uniform-density probe set used wherever a
-    # rotation-only target (g_rot/delta_rot) is fit or measured -- see that function's docstring
-    # for why this exists (mirrors the mexican-hat perturbation script's square->polar fix).
-    rotation_probe_n_angles: int = 8
 
     analysis_alphas: list[float] = field(
         default_factory=lambda: [1.0, 1.3, 1.6, 2.0, 2.5, 3.0]
@@ -237,14 +246,6 @@ class Config:
 
     tangent_svd_relative_cutoff: float = 1e-3
     top_parameters_to_report: int = 20
-    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
-    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
-    # sparse but can arbitrarily zero one of several collinear parameters), or
-    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
-    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
-    attribution_method: str = "elastic_net"
-
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -258,11 +259,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
-    parser.add_argument(
-        "--attribution-method",
-        choices=["l2", "l1", "elastic_net"],
-        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
-    )
     return parser.parse_args()
 
 
@@ -281,8 +277,6 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.l1_weight = args.l1_weight
     if args.augment_dataset is not None:
         cfg.augment_dataset = args.augment_dataset
-    if args.attribution_method:
-        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -402,40 +396,6 @@ def build_probe_grid(cfg: Config, device: torch.device, dtype: torch.dtype):
     return q1x, q1y, q2x, q2y
 
 
-def build_rotation_probe_grid(cfg: "Config", device: torch.device, dtype: torch.dtype):
-    """Rotation-uniform-density probe grid: polar (radius x angle) in BOTH the relative vector
-    r and the CM offset, replacing build_probe_grid's Cartesian (r_x, r_y, cm_x, cm_y) box for
-    every rotation-only quantity (g_rot/delta_rot fitting, and the rotation finite-transform
-    residual). Direct two-vector generalisation of the mexican-hat perturbation script's
-    square->polar override: a Cartesian box has non-uniform ANGULAR density (denser toward the
-    corners of each 2D subspace at a given radius), which biases an equal-row-weighted
-    least-squares fit of g_rot/delta_rot -- exactly the effect that was found to leak ~10%
-    cross-talk between c and b in the mexican-hat case. Since two-body's rotation acts
-    identically (same angle) on r and on the CM offset, both need the same polar treatment;
-    translation has no analogous angular-bias concern (it's linear/directional, not angular) so
-    build_probe_grid's plain Cartesian box is kept for translation-only quantities.
-
-    Same radial resolution as build_probe_grid (q_grid_points_per_axis rings for r,
-    cm_grid_points rings for the CM offset) so this samples a comparable radial range; angular
-    resolution is the new cfg.rotation_probe_n_angles knob, shared between r's angle and the CM
-    offset's angle. r=0 / cm=0 are deliberately excluded (angle undefined there), same
-    convention as the mexican-hat script's own polar grid.
-    """
-    n_r_radii = cfg.q_grid_points_per_axis
-    n_cm_radii = cfg.cm_grid_points
-    n_angles = cfg.rotation_probe_n_angles
-    r_radii = torch.linspace(cfg.q_extent / n_r_radii, cfg.q_extent, n_r_radii, device=device, dtype=dtype)
-    cm_radii = torch.linspace(cfg.cm_extent / n_cm_radii, cfg.cm_extent, n_cm_radii, device=device, dtype=dtype)
-    angles = torch.linspace(0.0, 2 * math.pi, n_angles + 1, device=device, dtype=dtype)[:-1]
-    r_rad, r_ang, cm_rad, cm_ang = torch.meshgrid(r_radii, angles, cm_radii, angles, indexing="ij")
-    r_rad, r_ang, cm_rad, cm_ang = (t.reshape(-1) for t in (r_rad, r_ang, cm_rad, cm_ang))
-    rx, ry = r_rad * torch.cos(r_ang), r_rad * torch.sin(r_ang)
-    cmx, cmy = cm_rad * torch.cos(cm_ang), cm_rad * torch.sin(cm_ang)
-    q1x, q1y = cmx + 0.5 * rx, cmy + 0.5 * ry
-    q2x, q2y = cmx - 0.5 * rx, cmy - 0.5 * ry
-    return q1x, q1y, q2x, q2y
-
-
 def rotation_matrix_2d(theta_degrees: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     theta = math.radians(theta_degrees)
     c, s = math.cos(theta), math.sin(theta)
@@ -489,68 +449,6 @@ def translation_generator_target(spatial_jacobian, direction: torch.Tensor) -> t
     (relative residual ~1e-14 at every alpha).
     """
     return -torch.einsum("nkj,j->nk", spatial_jacobian, direction)
-
-
-def build_polar_probe_grid_rotation_invariant(
-    n_radii: int, n_angles: int, r_max: float, device: torch.device, dtype: torch.dtype
-):
-    """Rotation-invariant probe set for the g-vs-delta split (see the Mexican-hat script's
-    build_polar_probe_grid for why this matters -- the group-average/Prop. 1 identity
-    requires an invariant probe measure, which the square Cartesian build_probe_grid is not).
-
-    Fixes the centre of mass at the origin (q1 = -q2 = r/2 on a circle) rather than
-    building a joint (relative, CM) polar grid: the potential V = -alpha/|q1-q2| only
-    depends on the relative separation, so CM position is physically irrelevant to the
-    rotational structure being tested here, and fixing it at the origin (itself trivially
-    rotation-invariant, being a single fixed point) keeps the grid small while remaining
-    exactly invariant under any rotation by a multiple of 360/n_angles degrees.
-    """
-    radii = torch.linspace(r_max / n_radii, r_max, n_radii, device=device, dtype=dtype)
-    angles = torch.linspace(0, 2 * math.pi, n_angles + 1, device=device, dtype=dtype)[:-1]
-    r_grid, a_grid = torch.meshgrid(radii, angles, indexing="ij")
-    rx = (r_grid * torch.cos(a_grid)).reshape(-1)
-    ry = (r_grid * torch.sin(a_grid)).reshape(-1)
-    q1x, q1y = 0.5 * rx, 0.5 * ry
-    q2x, q2y = -0.5 * rx, -0.5 * ry
-    return q1x, q1y, q2x, q2y
-
-
-def group_average_and_defect(
-    model: torch.nn.Module, q1x, q1y, q2x, q2y, alpha: float, architecture: str,
-    *, device: torch.device, dtype: torch.dtype, n_quadrature: int = 24,
-):
-    """Pi f_theta (SO(2) group average) and delta = f_theta - Pi f_theta, with Jacobians.
-
-    Rotation-only: translation is a noncompact group (unbounded R^2), so the
-    group-average integral (1/|G|) integral rho(h)^{-1} f(h.x) dh does not
-    converge for it the way it does for the compact SO(2) rotation group --
-    this construction is mathematically well-posed only for the rotation
-    generator here, by design (see the Mexican-hat script's
-    group_average_and_defect for the full derivation/Prop. 1).
-
-    Returns ``(f_x, j_x, pi_f, j_pi, delta, j_delta)``, shapes ``[N,4]``,
-    ``[N,4,P]``, ``[N,4]``, ``[N,4,P]``, ``[N,4]``, ``[N,4,P]``.
-    """
-    v_x, f_x, j_x = evaluate_at_points(model, q1x, q1y, q2x, q2y, alpha, architecture, device=device, dtype=dtype)
-    pi_f = torch.zeros_like(f_x)
-    pi_j = torch.zeros_like(j_x)
-    for k in range(n_quadrature):
-        theta_degrees = 360.0 * k / n_quadrature
-        r_phi = rotation_matrix_2d(theta_degrees, device, dtype)
-        rep_phi = rotation_rep_matrix_4d(r_phi)
-        q1x_r, q1y_r, q2x_r, q2y_r = rotate_points(q1x, q1y, q2x, q2y, r_phi)
-        _, f_rot, j_rot = evaluate_at_points(
-            model, q1x_r, q1y_r, q2x_r, q2y_r, alpha, architecture, device=device, dtype=dtype
-        )
-        rep_inv = rep_phi.T  # orthogonal: inverse = transpose
-        pi_f = pi_f + f_rot @ rep_inv.T
-        pi_j = pi_j + torch.einsum("dc,ncp->ndp", rep_inv, j_rot)
-    pi_f = pi_f / n_quadrature
-    pi_j = pi_j / n_quadrature
-    delta = f_x - pi_f
-    j_delta = j_x - pi_j
-    return f_x, j_x, pi_f, pi_j, delta, j_delta
-
 
 
 def _evaluate_learned_force_batched(
@@ -697,11 +595,8 @@ def learned_dqdt(model: torch.nn.Module, p1x, p1y, p2x, p2y, alpha: float, archi
 def analyse_checkpoint(
     model: torch.nn.Module, step: int, cfg: Config, device: torch.device, dtype: torch.dtype,
     flat_names: list[str], parameter_slices: dict[str, slice],
-    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
-    if attribution_l1_ratio_cache is None:
-        attribution_l1_ratio_cache = {}
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     parameter_value = torch.cat([p.detach().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1x_grid, q1y_grid, q2x_grid, q2y_grid = build_probe_grid(cfg, device, dtype)
@@ -748,41 +643,11 @@ def analyse_checkpoint(
         signed_sensitivity = torch.mean(j_x.detach().cpu().double(), dim=(0, 1))
         jac_flat = j_x.reshape(n_points * 4, -1)
 
-        xrot_target = rotation_generator_target(q1x_grid, q1y_grid, q2x_grid, q2y_grid, f_x, spatial_jac_x)
-        xrot_target_flat = xrot_target.reshape(n_points * 4)
-        (
-            xrot_projection_error, xrot_principal_angle,
-            xrot_coefficients, xrot_resolved_rank, xrot_singular_values,
-        ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
-
-        xtrans_target = translation_generator_target(spatial_jac_x, translation_direction)
-        xtrans_target_flat = xtrans_target.reshape(n_points * 4)
-        (
-            xtrans_projection_error, xtrans_principal_angle,
-            xtrans_coefficients, xtrans_resolved_rank, xtrans_singular_values,
-        ) = tangent_projection(jac_flat, xtrans_target_flat, cfg.tangent_svd_relative_cutoff)
-
-        # g_rot/g_trans (above, xrot_*/xtrans_*) are tangent to F's orbit under each symmetry,
-        # not radial -- each is provably orthogonal to that symmetry's own equivariance defect
-        # delta = F - Pi F (see compute_rotation_orbit_average/compute_translation_orbit_average
-        # docstrings). Attribute each delta with the same tangent_projection machinery, just a
-        # different right-hand side -- coefficients named b_rot_i/b_trans_i (c_i already taken
-        # by the g_rot/g_trans attribution).
-        pi_rot_f_x = compute_rotation_orbit_average(model, cfg, device, dtype, alpha, q1x_grid, q1y_grid, q2x_grid, q2y_grid)
-        delta_rot = f_x - pi_rot_f_x
-        delta_rot_flat = delta_rot.reshape(n_points * 4)
-        (
-            delta_rot_projection_error, delta_rot_principal_angle,
-            delta_rot_coefficients, delta_rot_resolved_rank, delta_rot_singular_values,
-        ) = tangent_projection(jac_flat, delta_rot_flat, cfg.tangent_svd_relative_cutoff)
-
-        pi_trans_f_x = compute_translation_orbit_average(f_x, cfg)
-        delta_trans = f_x - pi_trans_f_x
-        delta_trans_flat = delta_trans.reshape(n_points * 4)
-        (
-            delta_trans_projection_error, delta_trans_principal_angle,
-            delta_trans_coefficients, delta_trans_resolved_rank, delta_trans_singular_values,
-        ) = tangent_projection(jac_flat, delta_trans_flat, cfg.tangent_svd_relative_cutoff)
+        # xrot_*/xtrans_*/delta_rot_*/delta_trans_* (c_i/b_i for each symmetry) are NOT solved
+        # per-alpha here -- this script pools rows across alpha into one combined solve instead
+        # (see the "Pooled c_i/b_i" block after this loop) rather than solving independently at
+        # each alpha and RMS-aggregating afterward (that original definition lives in the
+        # un-suffixed sibling script, asrnn_two_body_symmetry_sensitivity.py).
 
         learned_dqdt_values = learned_dqdt(model, p1x_grid, p1y_grid, p2x_grid, p2y_grid, alpha, cfg.architecture)
         grad_e_p = torch.stack([p1x_grid, p1y_grid, p2x_grid, p2y_grid], dim=1)
@@ -816,32 +681,82 @@ def analyse_checkpoint(
                 "module_translation_equivariance_error": aggregate_by_module_mean(
                     translation_equivariance_error, parameter_slices
                 ),
-                "xrot_projection_error": xrot_projection_error,
-                "xrot_principal_angle_degrees": xrot_principal_angle,
-                "xrot_resolved_rank": xrot_resolved_rank,
-                "xrot_singular_values": xrot_singular_values,
-                "xrot_attribution_coefficients": xrot_coefficients.cpu().tolist(),
-                "module_xrot_attribution": aggregate_by_module(xrot_coefficients.abs(), parameter_slices),
-                "xtrans_projection_error": xtrans_projection_error,
-                "xtrans_principal_angle_degrees": xtrans_principal_angle,
-                "xtrans_resolved_rank": xtrans_resolved_rank,
-                "xtrans_singular_values": xtrans_singular_values,
-                "xtrans_attribution_coefficients": xtrans_coefficients.cpu().tolist(),
-                "module_xtrans_attribution": aggregate_by_module(xtrans_coefficients.abs(), parameter_slices),
-                "delta_rot_projection_error": delta_rot_projection_error,
-                "delta_rot_principal_angle_degrees": delta_rot_principal_angle,
-                "delta_rot_resolved_rank": delta_rot_resolved_rank,
-                "delta_rot_singular_values": delta_rot_singular_values,
-                "delta_rot_attribution_coefficients": delta_rot_coefficients.cpu().tolist(),
-                "module_delta_rot_attribution": aggregate_by_module(delta_rot_coefficients.abs(), parameter_slices),
-                "delta_trans_projection_error": delta_trans_projection_error,
-                "delta_trans_principal_angle_degrees": delta_trans_principal_angle,
-                "delta_trans_resolved_rank": delta_trans_resolved_rank,
-                "delta_trans_singular_values": delta_trans_singular_values,
-                "delta_trans_attribution_coefficients": delta_trans_coefficients.cpu().tolist(),
-                "module_delta_trans_attribution": aggregate_by_module(delta_trans_coefficients.abs(), parameter_slices),
+                # xrot_*/xtrans_*/delta_rot_*/delta_trans_* fields are filled in uniformly
+                # below, after the pooled solve -- see the "Pooled c_i/b_i" block.
             }
         )
+
+    # Pooled c_i/b_i, one combined least-squares solve per (symmetry, g-vs-delta) pair: stacks
+    # Jacobian/target rows across every alpha in cfg.training_alphas union cfg.analysis_alphas
+    # (alpha is just a network input feature here, not something requiring "data" at that
+    # value, so both sets are fair game -- see the mexican-hat pooled script's identical
+    # construction and full rationale). This is the direct generalisation of how
+    # tangent_projection already pools rows across every probe point q within one alpha to also
+    # pool across alpha itself, giving one c/b vector per symmetry valid across every probed
+    # regime at once, rather than a separate vector per alpha (RMS-aggregated only for
+    # magnitude-ranking purposes in the un-suffixed sibling script). The identical pooled
+    # vector is written into every alpha_results row below, so every downstream consumer (RMS
+    # "score" aggregation, CSV export, signed plots) picks it up unchanged -- RMS of an
+    # alpha-constant vector is just its own magnitude.
+    direction_alphas = sorted(set(round(a, 6) for a in cfg.training_alphas) | set(round(a, 6) for a in cfg.analysis_alphas))
+    jac_blocks, xrot_target_blocks, xtrans_target_blocks = [], [], []
+    delta_rot_target_blocks, delta_trans_target_blocks = [], []
+    for alpha in direction_alphas:
+        v_x, f_x, j_x, spatial_jac_x = evaluate_at_points(
+            model, q1x_grid, q1y_grid, q2x_grid, q2y_grid, alpha, cfg.architecture,
+            device=device, dtype=dtype, need_spatial_jacobian=True,
+        )
+        jac_blocks.append(j_x.reshape(n_points * 4, -1))
+        xrot_target_blocks.append(rotation_generator_target(q1x_grid, q1y_grid, q2x_grid, q2y_grid, f_x, spatial_jac_x).reshape(-1))
+        xtrans_target_blocks.append(translation_generator_target(spatial_jac_x, translation_direction).reshape(-1))
+        pi_rot_f_x = compute_rotation_orbit_average(model, cfg, device, dtype, alpha, q1x_grid, q1y_grid, q2x_grid, q2y_grid)
+        delta_rot_target_blocks.append((f_x - pi_rot_f_x).reshape(-1))
+        pi_trans_f_x = compute_translation_orbit_average(f_x, cfg)
+        delta_trans_target_blocks.append((f_x - pi_trans_f_x).reshape(-1))
+
+    jac_pooled = torch.cat(jac_blocks, dim=0)
+    (
+        xrot_projection_error, xrot_principal_angle,
+        xrot_coefficients, xrot_resolved_rank, xrot_singular_values,
+    ) = tangent_projection(jac_pooled, torch.cat(xrot_target_blocks, dim=0), cfg.tangent_svd_relative_cutoff)
+    (
+        xtrans_projection_error, xtrans_principal_angle,
+        xtrans_coefficients, xtrans_resolved_rank, xtrans_singular_values,
+    ) = tangent_projection(jac_pooled, torch.cat(xtrans_target_blocks, dim=0), cfg.tangent_svd_relative_cutoff)
+    (
+        delta_rot_projection_error, delta_rot_principal_angle,
+        delta_rot_coefficients, delta_rot_resolved_rank, delta_rot_singular_values,
+    ) = tangent_projection(jac_pooled, torch.cat(delta_rot_target_blocks, dim=0), cfg.tangent_svd_relative_cutoff)
+    (
+        delta_trans_projection_error, delta_trans_principal_angle,
+        delta_trans_coefficients, delta_trans_resolved_rank, delta_trans_singular_values,
+    ) = tangent_projection(jac_pooled, torch.cat(delta_trans_target_blocks, dim=0), cfg.tangent_svd_relative_cutoff)
+
+    for row in alpha_results:
+        row["xrot_projection_error"] = xrot_projection_error
+        row["xrot_principal_angle_degrees"] = xrot_principal_angle
+        row["xrot_resolved_rank"] = xrot_resolved_rank
+        row["xrot_singular_values"] = xrot_singular_values
+        row["xrot_attribution_coefficients"] = xrot_coefficients.cpu().tolist()
+        row["module_xrot_attribution"] = aggregate_by_module(xrot_coefficients.abs(), parameter_slices)
+        row["xtrans_projection_error"] = xtrans_projection_error
+        row["xtrans_principal_angle_degrees"] = xtrans_principal_angle
+        row["xtrans_resolved_rank"] = xtrans_resolved_rank
+        row["xtrans_singular_values"] = xtrans_singular_values
+        row["xtrans_attribution_coefficients"] = xtrans_coefficients.cpu().tolist()
+        row["module_xtrans_attribution"] = aggregate_by_module(xtrans_coefficients.abs(), parameter_slices)
+        row["delta_rot_projection_error"] = delta_rot_projection_error
+        row["delta_rot_principal_angle_degrees"] = delta_rot_principal_angle
+        row["delta_rot_resolved_rank"] = delta_rot_resolved_rank
+        row["delta_rot_singular_values"] = delta_rot_singular_values
+        row["delta_rot_attribution_coefficients"] = delta_rot_coefficients.cpu().tolist()
+        row["module_delta_rot_attribution"] = aggregate_by_module(delta_rot_coefficients.abs(), parameter_slices)
+        row["delta_trans_projection_error"] = delta_trans_projection_error
+        row["delta_trans_principal_angle_degrees"] = delta_trans_principal_angle
+        row["delta_trans_resolved_rank"] = delta_trans_resolved_rank
+        row["delta_trans_singular_values"] = delta_trans_singular_values
+        row["delta_trans_attribution_coefficients"] = delta_trans_coefficients.cpu().tolist()
+        row["module_delta_trans_attribution"] = aggregate_by_module(delta_trans_coefficients.abs(), parameter_slices)
 
     xrot_coefficient_matrix = np.asarray([r["xrot_attribution_coefficients"] for r in alpha_results])
     xrot_score = np.sqrt(np.mean(xrot_coefficient_matrix**2, axis=0))

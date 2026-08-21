@@ -1,4 +1,18 @@
-"""Functional-sensitivity experiment for the 2D isotropic double well ("Mexican hat").
+"""POOLED-DIRECTION variant of asrnn_mexican_hat_symmetry_sensitivity.py, for direct comparison.
+
+The only difference from the un-suffixed sibling script: c_i (rotation-generator attribution)
+and b_i (equivariance-defect attribution) are each solved ONCE per checkpoint from a single
+combined least-squares system that stacks Jacobian/target rows across every alpha in
+cfg.training_alphas union cfg.analysis_alphas, instead of being solved independently at each
+analysis alpha and then RMS-aggregated into a magnitude-only "score" afterward. See
+analyse_checkpoint's "Pooled c_i/b_i" block for the full rationale (in short: a per-alpha c_i,
+if ever used as an actual parameter-space step -- as in run_potential_walk_experiment.py -- gives
+a different perturbed model at each alpha, which isn't one coherent direction; pooling first
+avoids that). Run with the SAME config.json as an existing un-suffixed run (same seed => same
+training trajectory, since training itself never touches c_i/b_i) to get a directly comparable
+set of plots differing only in this one definitional choice.
+
+Functional-sensitivity experiment for the 2D isotropic double well ("Mexican hat").
 
 The physical system is
 
@@ -52,7 +66,6 @@ from experiment_common import (
     plot_training_history,
     robust_linthresh,
     prettify_parameter_name,
-    resolve_attribution_coefficients,
     run_training_loop,
     select_device,
     select_dtype,
@@ -88,7 +101,7 @@ class Config:
     seed: int = 42
     device: str = "auto"
     dtype: str = "float32"
-    output_dir: str = "outputs/asrnn_mexican_hat_symmetry"
+    output_dir: str = "outputs/asrnn_mexican_hat_symmetry_pooled"
 
     architecture: str = "hamiltonian"  # hamiltonian, direct_mlp, or equivariant
 
@@ -125,7 +138,7 @@ class Config:
     # architecture's parameters align more with the equivariant directions
     # (i.e. improve sensitivity equivariance E_i) by squeezing out redundant
     # capacity that has no reason to respect the symmetry on its own.
-    l1_weight: float = 0.0
+    l1_weight: float = 1e-5
     # Checkpoints are specified as fractions of training_steps (each in
     # [0, 1]) so they scale automatically if training_steps changes, e.g.
     # under --quick. Resolved to absolute step indices in validate_config.
@@ -177,12 +190,6 @@ class Config:
     tangent_svd_relative_cutoff: float = 1e-3
     representation_angle_threshold_degrees: float = 10.0
     top_parameters_to_report: int = 20
-    # How the per-parameter attribution coefficients c_i (tangent_projection_auto,
-    # sensitivity_tools.py) are solved: "l2" (min-norm, dense), "l1" (min-1-norm,
-    # sparse but can arbitrarily zero one of several collinear parameters), or
-    # "elastic_net" (default -- sparse like L1, but with the least ridge admixture
-    # needed to still tie-break collinear columns; see choose_l1_ratio_for_sparsity).
-    attribution_method: str = "l2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,11 +206,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l1-weight", type=float, help="Override Config.l1_weight.")
     parser.add_argument("--augment-dataset", dest="augment_dataset", action="store_true", default=None, help="Override Config.augment_dataset to True.")
     parser.add_argument("--no-augment-dataset", dest="augment_dataset", action="store_false", help="Override Config.augment_dataset to False.")
-    parser.add_argument(
-        "--attribution-method",
-        choices=["l2", "l1", "elastic_net"],
-        help="Override Config.attribution_method (how c_i is solved for; default elastic_net).",
-    )
     return parser.parse_args()
 
 
@@ -220,8 +222,6 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.l1_weight = args.l1_weight
     if args.augment_dataset is not None:
         cfg.augment_dataset = args.augment_dataset
-    if args.attribution_method:
-        cfg.attribution_method = args.attribution_method
     if args.quick:
         cfg.kinetic_hidden_dim = 8
         cfg.potential_hidden_dim = 8
@@ -253,8 +253,6 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("tangent_svd_relative_cutoff must lie strictly between 0 and 1.")
     if not all(0.0 <= f <= 1.0 for f in cfg.checkpoint_fractions):
         raise ValueError("checkpoint_fractions must all lie in [0, 1].")
-    if cfg.attribution_method not in {"l2", "l1", "elastic_net"}:
-        raise ValueError("attribution_method must be 'l2', 'l1', or 'elastic_net'.")
     cfg.checkpoint_steps = sorted(
         {int(round(f * cfg.training_steps)) for f in cfg.checkpoint_fractions}
         | {0, cfg.training_steps}
@@ -354,49 +352,6 @@ def rotation_generator_target(
     directional = torch.einsum("nkj,nj->nk", spatial_jacobian, omega_q)
     omega = ROTATION_LIE_GENERATOR.to(device=force.device, dtype=force.dtype)
     return directional - force @ omega.T
-
-def group_average_and_defect(
-    model: torch.nn.Module, q1_pts: torch.Tensor, q2_pts: torch.Tensor, alpha: float, architecture: str,
-    *, device: torch.device, dtype: torch.dtype, n_quadrature: int = 24,
-):
-    """Pi f_theta (SO(2) group average) and delta = f_theta - Pi f_theta = Q f_theta, with Jacobians.
-
-    Implements the review notes' split (Prop. 1: <delta, g> = <delta, X delta>
-    = 0, so g = X f_theta is tangent to the group orbit at *constant*
-    distance from the equivariant subspace E = ker X -- it measures orbit
-    "phase", not distance from equivariance, and does not by itself license
-    "symmetry breaking" language). ``delta`` is the actual departure from E;
-    its own attribution (via the same tangent-space machinery, using
-    ``j_delta`` as the Jacobian) is what licenses that language.
-
-    Pi f(q) = (1/2pi) integral rho(h_phi)^{-1} f(h_phi . q) dphi, approximated
-    by an ``n_quadrature``-point equally-spaced sum over rotation angles;
-    rho(h_phi) = R_phi acts on the 2D force output the same way it acts on
-    q. Since differentiation w.r.t. theta commutes with the average, the
-    Jacobian of Pi f is just the same average applied to J(h_phi . q) --
-    the code below computes f and J at each rotated point (reusing
-    ``evaluate_at_points``) and averages both, rotating each by R_phi^{-1}
-    before accumulating.
-
-    Returns ``(f_x, j_x, pi_f, j_pi, delta, j_delta)``, shapes ``[N,2]``,
-    ``[N,2,P]``, ``[N,2]``, ``[N,2,P]``, ``[N,2]``, ``[N,2,P]``.
-    """
-    v_x, f_x, j_x = evaluate_at_points(model, q1_pts, q2_pts, alpha, architecture, device=device, dtype=dtype)
-    pi_f = torch.zeros_like(f_x)
-    pi_j = torch.zeros_like(j_x)
-    for k in range(n_quadrature):
-        theta_degrees = 360.0 * k / n_quadrature
-        r_phi = rotation_matrix(theta_degrees, device, dtype)
-        q1_rot, q2_rot = transform_points(q1_pts, q2_pts, r_phi)
-        _, f_rot, j_rot = evaluate_at_points(model, q1_rot, q2_rot, alpha, architecture, device=device, dtype=dtype)
-        r_inv = r_phi.T  # orthogonal matrix: inverse = transpose
-        pi_f = pi_f + f_rot @ r_inv.T
-        pi_j = pi_j + torch.einsum("dc,ncp->ndp", r_inv, j_rot)
-    pi_f = pi_f / n_quadrature
-    pi_j = pi_j / n_quadrature
-    delta = f_x - pi_f
-    j_delta = j_x - pi_j
-    return f_x, j_x, pi_f, pi_j, delta, j_delta
 
 
 def evaluate_at_points(
@@ -545,11 +500,8 @@ def compute_orbit_average(
 def analyse_checkpoint(
     model: torch.nn.Module, step: int, cfg: Config, device: torch.device, dtype: torch.dtype,
     flat_names: list[str], parameter_slices: dict[str, slice],
-    attribution_l1_ratio_cache: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     model.eval()
-    if attribution_l1_ratio_cache is None:
-        attribution_l1_ratio_cache = {}
     parameter_magnitude = torch.cat([p.detach().abs().reshape(-1) for p in model.parameters()]).cpu().tolist()
     parameter_value = torch.cat([p.detach().reshape(-1) for p in model.parameters()]).cpu().tolist()
     q1_grid, q2_grid = build_probe_grid(cfg, device, dtype)
@@ -590,25 +542,14 @@ def analyse_checkpoint(
             bifurcation_coefficients, bifurcation_resolved_rank, bifurcation_singular_values,
         ) = tangent_projection(jac_flat, bifurcation_target_flat, cfg.tangent_svd_relative_cutoff)
 
+        # xrot_target_flat is still needed below for generator_matrix/dimension_info; the
+        # per-alpha tangent_projection solve against it (and against delta) is NOT done here
+        # any more -- this script pools rows across alpha into one combined solve instead (see
+        # the "Pooled c_i/b_i" block after this loop) rather than solving independently at each
+        # alpha and RMS-aggregating afterward (that original definition lives in the un-suffixed
+        # sibling script, asrnn_mexican_hat_symmetry_sensitivity.py).
         xrot_target = rotation_generator_target(q1_grid, q2_grid, f_x, spatial_jac_x)
         xrot_target_flat = xrot_target.reshape(n_points * 2)
-        (
-            xrot_projection_error, xrot_principal_angle,
-            xrot_coefficients, xrot_resolved_rank, xrot_singular_values,
-        ) = tangent_projection(jac_flat, xrot_target_flat, cfg.tangent_svd_relative_cutoff)
-
-        # g = X_rot F_theta (above, xrot_*) is tangent to F_theta's group orbit, not radial --
-        # it is provably orthogonal to delta = F_theta - Pi F_theta, the actual "distance from
-        # equivariant" direction (see compute_orbit_average's docstring). Attribute delta with
-        # exactly the same tangent_projection machinery, just a different right-hand side --
-        # coefficients here are named b_i (c_i is already taken by the g/xrot attribution).
-        pi_f_x = compute_orbit_average(model, cfg, device, dtype, alpha, q1_grid, q2_grid)
-        delta = f_x - pi_f_x
-        delta_flat = delta.reshape(n_points * 2)
-        (
-            delta_projection_error, delta_principal_angle,
-            delta_coefficients, delta_resolved_rank, delta_singular_values,
-        ) = tangent_projection(jac_flat, delta_flat, cfg.tangent_svd_relative_cutoff)
 
         generator_matrix = torch.stack([bifurcation_target_flat, xrot_target_flat], dim=1)
         dimension_info = principal_angles_and_dimension(
@@ -661,22 +602,60 @@ def analyse_checkpoint(
                 "module_bifurcation_attribution": aggregate_by_module(
                     bifurcation_coefficients.abs(), parameter_slices
                 ),
-                "xrot_projection_error": xrot_projection_error,
-                "xrot_principal_angle_degrees": xrot_principal_angle,
-                "xrot_resolved_rank": xrot_resolved_rank,
-                "xrot_singular_values": xrot_singular_values,
-                "xrot_attribution_coefficients": xrot_coefficients.cpu().tolist(),
-                "module_xrot_attribution": aggregate_by_module(xrot_coefficients.abs(), parameter_slices),
-                "delta_projection_error": delta_projection_error,
-                "delta_principal_angle_degrees": delta_principal_angle,
-                "delta_resolved_rank": delta_resolved_rank,
-                "delta_singular_values": delta_singular_values,
-                "delta_attribution_coefficients": delta_coefficients.cpu().tolist(),
-                "module_delta_attribution": aggregate_by_module(delta_coefficients.abs(), parameter_slices),
+                # xrot_*/delta_* (c_i/b_i) fields are filled in uniformly below, after the
+                # pooled solve -- see the "Pooled c_i/b_i" block.
                 "joint_representation_dimension": dimension_info["representation_dimension"],
                 "joint_principal_angles_degrees": dimension_info["principal_angles_degrees"],
             }
         )
+
+    # Pooled c_i/b_i: ONE combined least-squares solve stacking Jacobian/target rows across
+    # every alpha in cfg.training_alphas union cfg.analysis_alphas (alpha is just a network
+    # input feature here, not something requiring "data" at that value, so both sets are fair
+    # game -- see run_potential_walk_experiment.py's combined_direction for the identical
+    # construction and the full rationale). This is the direct generalisation of how
+    # tangent_projection already pools rows across every probe point q within one alpha to also
+    # pool across alpha itself, giving one c/b vector valid across every probed regime at once,
+    # rather than a separate vector per alpha (RMS-aggregated only for magnitude-ranking
+    # purposes in the un-suffixed sibling script). The identical pooled vector is written into
+    # every alpha_results row below, so every downstream consumer (RMS "score" aggregation,
+    # CSV export, signed plots) picks it up unchanged -- RMS of an alpha-constant vector is
+    # just its own magnitude, so xrot_score/b_score end up being exactly |pooled c|/|pooled b|.
+    direction_alphas = sorted(set(round(a, 6) for a in cfg.training_alphas) | set(round(a, 6) for a in cfg.analysis_alphas))
+    jac_blocks, xrot_target_blocks, delta_target_blocks = [], [], []
+    for alpha in direction_alphas:
+        v_x, f_x, j_x, spatial_jac_x = evaluate_at_points(
+            model, q1_grid, q2_grid, alpha, cfg.architecture, device=device, dtype=dtype, need_spatial_jacobian=True
+        )
+        jac_blocks.append(j_x.reshape(n_points * 2, -1))
+        xrot_target_blocks.append(rotation_generator_target(q1_grid, q2_grid, f_x, spatial_jac_x).reshape(-1))
+        pi_f_x = compute_orbit_average(model, cfg, device, dtype, alpha, q1_grid, q2_grid)
+        delta_target_blocks.append((f_x - pi_f_x).reshape(-1))
+    jac_pooled = torch.cat(jac_blocks, dim=0)
+    xrot_target_pooled = torch.cat(xrot_target_blocks, dim=0)
+    delta_target_pooled = torch.cat(delta_target_blocks, dim=0)
+    (
+        pooled_xrot_projection_error, pooled_xrot_principal_angle,
+        pooled_xrot_coefficients, pooled_xrot_resolved_rank, pooled_xrot_singular_values,
+    ) = tangent_projection(jac_pooled, xrot_target_pooled, cfg.tangent_svd_relative_cutoff)
+    (
+        pooled_delta_projection_error, pooled_delta_principal_angle,
+        pooled_delta_coefficients, pooled_delta_resolved_rank, pooled_delta_singular_values,
+    ) = tangent_projection(jac_pooled, delta_target_pooled, cfg.tangent_svd_relative_cutoff)
+
+    for row in alpha_results:
+        row["xrot_projection_error"] = pooled_xrot_projection_error
+        row["xrot_principal_angle_degrees"] = pooled_xrot_principal_angle
+        row["xrot_resolved_rank"] = pooled_xrot_resolved_rank
+        row["xrot_singular_values"] = pooled_xrot_singular_values
+        row["xrot_attribution_coefficients"] = pooled_xrot_coefficients.cpu().tolist()
+        row["module_xrot_attribution"] = aggregate_by_module(pooled_xrot_coefficients.abs(), parameter_slices)
+        row["delta_projection_error"] = pooled_delta_projection_error
+        row["delta_principal_angle_degrees"] = pooled_delta_principal_angle
+        row["delta_resolved_rank"] = pooled_delta_resolved_rank
+        row["delta_singular_values"] = pooled_delta_singular_values
+        row["delta_attribution_coefficients"] = pooled_delta_coefficients.cpu().tolist()
+        row["module_delta_attribution"] = aggregate_by_module(pooled_delta_coefficients.abs(), parameter_slices)
 
     coefficient_matrix = np.asarray([r["bifurcation_attribution_coefficients"] for r in alpha_results])
     bifurcation_score = np.sqrt(np.mean(coefficient_matrix**2, axis=0))
