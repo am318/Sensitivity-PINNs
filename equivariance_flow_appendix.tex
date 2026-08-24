@@ -1,0 +1,154 @@
+\section{Experimental design: walking the attribution directions}
+\label{app:equivariance-flow}
+
+Full detail for the experiment summarised in
+\S\ref{sec:equivariance-flow}, implemented in
+\texttt{aep\_core\_annulus\_equivariance\_flow.py}. The \textsc{resolved} and
+\textsc{fixed} modes write to
+\texttt{outputs/aep\_core\_annulus\_equivariance\_flow[\_fixed]} respectively.
+
+\subsection{Model and data}
+
+The annulus classifier of \texttt{aep\_core\_annulus\_mlp.py}: an MLP
+$f_\theta:\mathbb{R}^2\to\mathbb{R}$ (hidden width $96$, depth $4$, GELU,
+$19{,}009$ parameters), trained by binary cross-entropy (Adam, learning rate
+$3\times10^{-3}$, $200$ epochs, no augmentation or equivariance penalty) to
+separate a filled unit disc ($y=+1$, $100$ points, $r\le1$) from an outer
+annular band ($y=-1$, $100$ points, $r\in[2.3,3.0]$). The rule depends only
+on $r$ and is therefore exactly $\mathrm{SO}(2)$-invariant. Two datasets vary
+the angular extent of the outer band: a $90^\circ$ wedge (final loss
+$6.4\times10^{-7}$) and the full $360^\circ$ annulus (final loss
+$8.9\times10^{-7}$); both are run at their initial and final weights, giving
+four conditions. The wedge and full runs share an initialisation, so their
+\textsc{initial} columns are identical up to floating point and act as a
+built-in control.
+
+\subsection{Targets and their exact flows}
+
+Let $J_\theta\in\mathbb{R}^{N\times P}$ be the sensitivity Jacobian on a
+probe grid ($24\times24$ on $[-3.5,3.5]^2$, points beyond radius $3.5$
+dropped, $N=408$), $\Pi$ the group average over $C_{64}$ (a finite
+quadrature for the $\mathrm{SO}(2)$ Haar average, exact and idempotent by
+construction), and $Xf_\theta(x)=\nabla_xf_\theta(x)\cdot(-x_2,x_1)$ the
+infinitesimal rotation generator. Write $\delta=f_\theta-\Pi f_\theta$ and
+$g=Xf_\theta$. For each target we solve $J_\theta z\approx\text{target}$ for
+its minimum-norm least-squares solution via a truncated SVD of $J_\theta$
+(relative cutoff $10^{-3}$, column-normalised, following
+\texttt{sensitivity\_tools.tangent\_projection}), giving directions $c$
+(target $g$) and $b$ (target $\delta$). Steps are taken along $+c$ and
+$-b$, so both walks run on a common positive time axis.
+
+Since any $z$ with $J_\theta z\approx\text{target}$ induces the same
+first-order change in $f_\theta$, both walks admit an exact prediction for
+the induced flow in function space, independent of the SVD truncation and
+norm choice (only the parameter-space path length depends on those):
+\begin{align}
+  \dot f_t = Xf_t &\;\Longrightarrow\; f_t = f_0\circ R_t
+  &&\text{(along $+c$; $t=1$ is a $57.3^\circ$ rotation)} \label{eq:app-c-flow}\\
+  \dot f_t = -(I-\Pi)f_t &\;\Longrightarrow\; f_t = \Pi f_0+e^{-t}\delta_0
+  &&\text{(along $-b$; defect $\to e^{-1}\lVert\delta_0\rVert$ at $t=1$)} \label{eq:app-b-flow}
+\end{align}
+
+\subsection{Two integration modes}
+
+Forward Euler, $t=0,\mathrm{d}t,\dots,1$, $\mathrm{d}t=1/200$ ($200$ steps).
+\textsc{Resolved} re-solves $z_t$ from $J_{\theta_t}$ at every step, following
+the true integral curve. \textsc{Fixed} solves $z_0$ once at $t=0$ and reuses
+it, so $k$ steps of $\mathrm{d}t\,z_0$ sum to one step of $k\,\mathrm{d}t\,z_0$
+and the path is the straight line $\theta_0+t z_0$. Both modes share the time
+grid, targets, and diagnostics, so the two output directories are comparable
+panel for panel. Along the \textsc{resolved} path we additionally score the
+direction \emph{frozen at $t=0$} against the current target,
+$\lVert J_{\theta_t}z_0-\text{target}(\theta_t)\rVert /
+\lVert\text{target}(\theta_t)\rVert$ -- exactly the bet \textsc{fixed} is
+making -- and, since $z_0$ is already in hand, compute the \textsc{fixed}
+trajectory itself for free as an overlay. Cross-checking this overlay against
+an independent run of \textsc{fixed} mode agrees to $\sim10^{-13}$ relative
+error on $\lVert(I-\Pi)f_t\rVert$ across all eight (condition, target) pairs.
+
+\subsection{Diagnostics}
+
+At every one of the $201$ stops, for each condition and target, we record:
+the non-invariant component $\lVert(I-\Pi)f_t\rVert$ and its relative size,
+against the exact prediction; the function-level rotation-invariance error
+$\mathcal{E}(T)=\max_\alpha\lvert f_t(R_\alpha x)-f_t(x)\rvert$ over $40$
+angles fixed across the walk; distance from $f_t$ to the exact trajectory and
+to the fixed endpoint target ($f_0\circ R_1$ or $\Pi f_0$), normalised by
+$\lVert f_0\rVert$; the realisation error $\lVert J_{\theta_t}z-g\rVert/
+\lVert g\rVert$ for the direction taken and (\textsc{resolved} only) for the
+direction frozen at $t=0$; task BCE and accuracy, plus the loss/accuracy of
+the exactly projected model $\Pi f_{\theta_t}$; and the distance travelled and
+path length in parameter space.
+
+In addition we evaluate $f_t$ on a single orbit $r=1$ ($=r_{\rm inner}$,
+where the label rule switches sign) at $360$ angles and record the angular
+deviation profile $d_t(\theta)=f_t(r\cos\theta,r\sin\theta)-\langle
+f_t(r,\cdot)\rangle_\theta$ -- exactly $(I-\Pi)f_t$ restricted to that orbit
+-- with predictions $d_t(\theta)=d_0(\theta+t)$ (phase shift, along $c$) and
+$d_t(\theta)=e^{-t}d_0(\theta)$ (shape-preserving contraction, along $-b$):
+the cleanest empirical separation of "moved along the orbit" from
+"symmetrised", since the first changes phase with no amplitude change and the
+second the reverse.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+quantity & value \\
+\midrule
+probe grid & $24\times24$ on $[-3.5,3.5]^2$, radius $\le3.5$ ($408$ points) \\
+group order ($C_m$ quadrature for $\Pi$) & $m=64$ \\
+SVD relative cutoff & $10^{-3}$ \\
+flow time & $t\in[0,1]$, $200$ Euler steps ($\mathrm{d}t=0.005$) \\
+angular-profile orbit radius / angles & $r=1$ ($=r_{\rm inner}$) / $360$ \\
+invariance-error rotations & $40$, fixed seed across the walk \\
+snapshot times & $0,0.2,0.4,0.6,0.8,1.0$ \\
+\bottomrule
+\end{tabular}
+\caption{Numerical settings, shared by \textsc{resolved} and \textsc{fixed}.}
+\label{tab:equivariance-flow-settings}
+\end{table}
+
+\subsection{Full results}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llrrrrr}
+\toprule
+target & condition & \multicolumn{2}{c}{resolved: $\lVert\delta\rVert$ start$\to$end (pred.)} & acc.\ start$\to$end & \multicolumn{2}{c}{fixed: $\lVert\delta\rVert$ end, acc.\ end} \\
+\midrule
+$+c$ & wedge/init.\  & $0.273\to0.281$ & ($0.273$) & $0.500\to0.500$ & $0.689$ & $0.500$ \\
+$+c$ & wedge/trained & $298\to298$     & ($298$)   & $1.000\to0.840$ & $321$   & $0.845$ \\
+$+c$ & full/init.\   & $0.273\to0.281$ & ($0.273$) & $0.500\to0.500$ & $0.689$ & $0.500$ \\
+$+c$ & full/trained  & $56.1\to56.5$   & ($56.1$)  & $1.000\to1.000$ & $1237$  & $0.700$ \\
+$-b$ & wedge/init.\  & $0.273\to0.100$ & ($0.101$) & $0.500\to0.500$ & $0.015$ & $0.500$ \\
+$-b$ & wedge/trained & $298\to109$     & ($110$)   & $1.000\to1.000$ & $823$   & $0.405$ \\
+$-b$ & full/init.\   & $0.273\to0.100$ & ($0.101$) & $0.500\to0.500$ & $0.015$ & $0.500$ \\
+$-b$ & full/trained  & $56.1\to20.5$   & ($20.6$)  & $1.000\to1.000$ & $95.4$  & $1.000$ \\
+\bottomrule
+\end{tabular}
+\caption{Non-invariant component $\lVert(I-\Pi)f\rVert$ at $t=0$ and $t=1$
+under \textsc{resolved} integration, against the closed-form prediction of
+\eqref{eq:app-c-flow}/\eqref{eq:app-b-flow}, and task accuracy;
+alongside $\lVert(I-\Pi)f\rVert$ and accuracy at $t=1$ under \textsc{fixed}
+integration on the same time grid. \textsc{Resolved} matches its prediction
+in every row; \textsc{fixed} moves the defect in the wrong direction on every
+trained condition.}
+\label{tab:equivariance-flow-results}
+\end{table}
+
+\subsection{Figures}
+
+Each output directory contains, for both targets and all four conditions:
+\texttt{angular\_deviation\_flow} (profile $d_t(\theta)$ at the six snapshot
+times, rows $=\{c,-b\}$, dotted $=$ exact prediction);
+\texttt{angular\_deviation\_heatmap} (the same profile as a surface over
+$(\theta,t)$ using all $201$ stops); \texttt{angular\_deviation\_amplitude}
+(RMS$_\theta(d_t)/$RMS$_\theta(d_0)$ and residual from each prediction);
+\texttt{equivariance\_flow\_\{c,b\}} (the scalar diagnostics against $t$);
+\texttt{flow\_vs\_fixed\_step\_\{c,b\}} (this run's walk, solid, against the
+other mode's, dashed); \texttt{decision\_boundary\_flow\_\{c,b\}} (the
+decision boundary at the six snapshot times, rows $=$ condition, columns
+$=t$).
+

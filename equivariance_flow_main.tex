@@ -1,0 +1,73 @@
+\section{Does the attribution direction hold up as a step, not just a snapshot?}
+\label{sec:equivariance-flow}
+
+The attribution coefficients $c$ (aligned with the orbit generator $g=Xf_\theta$)
+and $b$ (aligned with the non-equivariant residual $\delta=f_\theta-\Pi f_\theta$)
+are read off from a single set of weights. We ask whether they mean anything
+beyond that snapshot: if we actually move the parameters along $c$ or $-b$,
+does the model change the way the attribution predicts, and does that
+prediction survive being re-derived at every step versus being taken once and
+extrapolated? A direction that only describes an infinitesimal neighbourhood
+of $\theta_0$ is a weaker object than one that describes a trajectory.
+
+\subsection{Systems}
+\label{sec:equivariance-flow-systems}
+
+We use the annulus classifier: an MLP trained to separate an inner disc from
+an outer band by radius alone, an exactly $\mathrm{SO}(2)$-invariant task. Two
+training sets vary how much of the orbit is observed -- a $90^\circ$ wedge of
+the outer band, and the full $360^\circ$ annulus -- crossed with the
+initial and trained weights, for four conditions. The two wedge/full runs
+share an initialisation, giving an exact-agreement control column for free.
+
+\subsection{Stepping with and without recomputing}
+\label{sec:equivariance-flow-method}
+
+$c$ and $b$ solve $J_\theta z\approx\text{target}$ by minimum-norm
+least-squares and are exact only to first order at $\theta$, so each defines
+a vector field on parameter space rather than a single vector. We integrate
+that field by forward Euler, $\theta_{t+\mathrm{d}t}=\theta_t+\mathrm{d}t\,z_t$
+(sign $+$ for $c$, $-$ for $b$), in two ways:
+\begin{description}
+  \item[\textsc{resolved}] re-solve $z_t$ from $J_{\theta_t}$ at every step,
+    following the true integral curve;
+  \item[\textsc{fixed}] solve $z_0$ once, at the start, and reuse it at every
+    step, so the path is the straight line $\theta_0+t\,z_0$ -- the naive
+    reading of "the attribution is $z_0$" taken at face value.
+\end{description}
+Both target directions admit an exact, parameter-free prediction for what
+should happen to $f_\theta$ under \textsc{resolved} integration: walking along
+$c$ should rigidly rotate the decision function around the orbit while
+leaving its non-equivariant part $\lVert(I-\Pi)f\rVert$ unchanged; walking
+along $-b$ should leave the equivariant part fixed and shrink the defect
+exponentially, to $e^{-1}\approx37\%$ of its start value after one unit of
+flow time -- not to zero, which is where a single linear step implicitly
+aims. We track both predictions, plus task accuracy and loss, along $t\in[0,1]$
+for every condition and both modes (full numerical detail in
+Appendix~\ref{app:equivariance-flow}).
+
+\subsection{Observations}
+\label{sec:equivariance-flow-observations}
+
+\textsc{Resolved} matches its prediction closely for every condition and both
+targets: the rotation leaves $\lVert(I-\Pi)f\rVert$ within $2\%$ of its start
+value, and the defect walk lands within $1\%$ of $e^{-1}\lVert\delta_0\rVert$,
+in all four conditions. Task accuracy is preserved everywhere except the
+wedge/trained model under rotation, where it falls from $1.00$ to $0.84$ --
+transporting a model 57$^\circ$ off the only data it was trained on costs
+accuracy, and only there.
+
+\textsc{Fixed} does not. On the trained models it moves the model in the
+\emph{wrong} direction relative to its own target: the defect it should be
+removing grows instead of shrinking (wedge/trained: $2.98\times10^2\to
+8.23\times10^2$ along $-b$; full/trained: $5.6\times10^1\to1.24\times10^3$
+along $c$, a $22\times$ increase where \textsc{resolved} stays flat at
+$5.6\times10^1$), and accuracy collapses on wedge/trained under $-b$
+($1.00\to0.41$, below chance). At initialisation, where the model is close to
+linear, the fixed step is harmless or even slightly ahead of the true flow;
+only once the model is trained does re-solving become necessary, and by how
+much scales with how non-equivariant the model already is. A snapshot
+attribution, taken once and trusted as a direction to move in, is reliable
+exactly where the network is closest to equivariant already, and misleading
+exactly where a symmetry claim would be most consequential.
+
